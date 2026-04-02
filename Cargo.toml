@@ -3,6 +3,12 @@ name = "mps"
 version = "0.5.5"
 edition = "2021"
 license = "MPL-2.0"
+description = "Bare-metal CPU scheduler, overlapped physics dispatcher, and runtime-dispatched SIMD kernels for Tileline."
+repository = "https://github.com/berrycomp/mps"
+readme = "README.md"
+keywords = ["scheduler", "simd", "physics", "lock-free", "tileline"]
+categories = ["concurrency", "game-development"]
+rust-version = "1.78"
 
 [dependencies]
 aes = "0.8.4"
