@@ -166,24 +166,15 @@ impl ParkingPrimitive {
         let _ = self.condvar.wait_timeout(guard, timeout);
     }
 
-    #[cfg(target_os = "linux")]
-    fn wait_for_change(&self, _epoch: &AtomicU32, _expected: u32, _timeout: Duration) {}
-
     #[cfg(not(target_os = "linux"))]
     fn wake_one(&self) {
         self.condvar.notify_one();
     }
 
-    #[cfg(target_os = "linux")]
-    fn wake_one(&self) {}
-
     #[cfg(not(target_os = "linux"))]
     fn wake_all(&self) {
         self.condvar.notify_all();
     }
-
-    #[cfg(target_os = "linux")]
-    fn wake_all(&self) {}
 }
 
 impl WorkerSignal {

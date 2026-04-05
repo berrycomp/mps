@@ -50,7 +50,7 @@ fn apply_thread_qos(class: CpuClass, core_id: usize) {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
-        let ncpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as usize;
+        let ncpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN).max(1) as usize;
         // Primary core
         libc::CPU_SET(core_id, &mut set);
         // Allow migration to ±1 neighbour for load sharing
@@ -60,7 +60,13 @@ fn apply_thread_qos(class: CpuClass, core_id: usize) {
         if core_id + 1 < ncpus {
             libc::CPU_SET(core_id + 1, &mut set);
         }
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        let affinity_rc = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+        if affinity_rc != 0 {
+            eprintln!(
+                "[mps linux] sched_setaffinity(core={core_id}) failed errno={}",
+                linux_errno()
+            );
+        }
     }
 
     // Set thread niceness to hint at relative priority.
@@ -72,8 +78,24 @@ fn apply_thread_qos(class: CpuClass, core_id: usize) {
         CpuClass::Efficient => 5,
     };
     unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, nice_val);
+        let priority_rc = libc::setpriority(libc::PRIO_PROCESS, 0, nice_val);
+        if priority_rc != 0 {
+            let errno = linux_errno();
+            // Negative nice values commonly fail without elevated privileges.
+            let expected_nice_denial = nice_val < 0 && matches!(errno, libc::EPERM | libc::EACCES);
+            if !expected_nice_denial {
+                eprintln!(
+                    "[mps linux] setpriority(nice={nice_val}, class={class:?}) failed errno={errno}"
+                );
+            }
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn linux_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
@@ -248,10 +270,10 @@ pub struct MpsScheduler {
     /// Thread handles stored separately so wake_one_worker can unpark without
     /// needing mutable access to the JoinHandle list.
     worker_threads: Vec<Thread>,
-    /// Number of Performance-class workers at the front of worker_threads.
-    /// preferred_core_ids() sorts P-cores first, so workers[0..performance_worker_count]
-    /// are P-core workers and workers[performance_worker_count..] are E-core workers.
-    performance_worker_count: usize,
+    /// Worker indices mapped to Performance-class cores.
+    performance_worker_indices: Vec<usize>,
+    /// Worker indices mapped to Efficient-class cores.
+    efficient_worker_indices: Vec<usize>,
     /// Round-robin index for distributing unpark calls across workers.
     unpark_index: AtomicU64,
     workers: Vec<JoinHandle<()>>,
@@ -288,9 +310,11 @@ impl MpsScheduler {
         let completed = Arc::new(AtomicU64::new(0));
         let failed = Arc::new(AtomicU64::new(0));
         let class_counters = Arc::new(ClassCounters::default());
+        let worker_core_ids = topology.preferred_core_ids();
 
         let workers = spawn_workers(
             &topology,
+            &worker_core_ids,
             queue.clone(),
             Arc::clone(&dispatcher),
             Arc::clone(&shutdown),
@@ -300,11 +324,24 @@ impl MpsScheduler {
         );
 
         // Collect Thread references from handles so enqueue_payload can unpark
-        // sleeping workers without touching the JoinHandle ownership.
-        // preferred_core_ids() sorts P-cores first, so the first `performance_cores`
-        // entries are always Performance-class workers.
+        // sleeping workers without touching the JoinHandle ownership. Keep
+        // class-index maps so wake routing remains correct even when Unknown
+        // cores are interleaved between classes.
         let worker_threads: Vec<Thread> = workers.iter().map(|h| h.thread().clone()).collect();
-        let performance_worker_count = topology.performance_cores.min(worker_threads.len());
+        let worker_classes: Vec<CpuClass> = worker_core_ids
+            .iter()
+            .map(|&core_id| topology.class_for_core(core_id))
+            .collect();
+        let performance_worker_indices: Vec<usize> = worker_classes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, class)| (*class == CpuClass::Performance).then_some(index))
+            .collect();
+        let efficient_worker_indices: Vec<usize> = worker_classes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, class)| (*class == CpuClass::Efficient).then_some(index))
+            .collect();
 
         Self {
             topology,
@@ -317,7 +354,8 @@ impl MpsScheduler {
             class_counters,
             next_task_id: AtomicU64::new(1),
             worker_threads,
-            performance_worker_count,
+            performance_worker_indices,
+            efficient_worker_indices,
             unpark_index: AtomicU64::new(0),
             workers,
         }
@@ -429,6 +467,8 @@ impl MpsScheduler {
     /// Wait until the queue is drained or a timeout expires.
     pub fn wait_for_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
+        let mut spin_loops = 0u32;
+        let mut sleep_step = Duration::from_micros(50);
         while started.elapsed() <= timeout {
             let submitted = self.submitted.load(Ordering::Acquire);
             let finished =
@@ -436,7 +476,26 @@ impl MpsScheduler {
             if self.queue.is_empty() && finished >= submitted {
                 return true;
             }
-            thread::sleep(Duration::from_millis(1));
+
+            if spin_loops < 256 {
+                spin_loops += 1;
+                std::hint::spin_loop();
+                continue;
+            }
+
+            if spin_loops < 1024 {
+                spin_loops += 1;
+                thread::yield_now();
+                continue;
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+
+            thread::sleep(sleep_step.min(remaining));
+            sleep_step = (sleep_step * 2).min(Duration::from_millis(1));
         }
         false
     }
@@ -498,14 +557,20 @@ impl MpsScheduler {
         if total == 0 {
             return;
         }
-        let p = self.performance_worker_count;
-        let (start, len) = match class {
-            CpuClass::Performance if p > 0 => (0, p),
-            CpuClass::Efficient if p < total => (p, total - p),
-            _ => (0, total),
+
+        let targeted_pool = match class {
+            CpuClass::Performance => &self.performance_worker_indices,
+            CpuClass::Efficient => &self.efficient_worker_indices,
+            CpuClass::Unknown => &self.performance_worker_indices,
         };
+
         let index = self.unpark_index.fetch_add(1, Ordering::Relaxed) as usize;
-        self.worker_threads[start + index % len].unpark();
+        if targeted_pool.is_empty() {
+            self.worker_threads[index % total].unpark();
+        } else {
+            let worker_index = targeted_pool[index % targeted_pool.len()];
+            self.worker_threads[worker_index].unpark();
+        }
     }
 
     /// Unpark up to `n` workers for batch submissions.
@@ -538,6 +603,7 @@ impl Drop for MpsScheduler {
 
 fn spawn_workers(
     topology: &CpuTopology,
+    core_ids: &[usize],
     queue: PriorityTaskQueue,
     dispatcher: Arc<Dispatcher>,
     shutdown: Arc<AtomicBool>,
@@ -545,10 +611,9 @@ fn spawn_workers(
     failed: Arc<AtomicU64>,
     class_counters: Arc<ClassCounters>,
 ) -> Vec<JoinHandle<()>> {
-    let core_ids = topology.preferred_core_ids();
     let mut handles = Vec::with_capacity(core_ids.len());
 
-    for (worker_index, core_id) in core_ids.into_iter().enumerate() {
+    for (worker_index, &core_id) in core_ids.iter().enumerate() {
         let worker_queue = queue.clone();
         let worker_dispatcher = Arc::clone(&dispatcher);
         let worker_shutdown = Arc::clone(&shutdown);

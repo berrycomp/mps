@@ -65,8 +65,9 @@ impl CpuTopology {
         let vendor = detect_vendor();
 
         let frequency_map = detect_linux_frequencies(logical_cores);
-        let classes = detect_macos_core_classes(logical_cores)
-            .unwrap_or_else(|| classify_cores(logical_cores, frequency_map.as_deref()));
+        let classes = detect_macos_core_classes(logical_cores).unwrap_or_else(|| {
+            classify_cores(logical_cores, frequency_map.as_deref(), vendor.as_deref())
+        });
 
         let mut cores = Vec::with_capacity(logical_cores);
         for core_id in 0..logical_cores {
@@ -265,12 +266,20 @@ fn read_sysctl_usize(key: &str) -> Option<usize> {
     }
 }
 
-fn classify_cores(logical_cores: usize, frequencies: Option<&[Option<u64>]>) -> Vec<CpuClass> {
+fn classify_cores(
+    logical_cores: usize,
+    frequencies: Option<&[Option<u64>]>,
+    vendor: Option<&str>,
+) -> Vec<CpuClass> {
     let mut classes = vec![CpuClass::Performance; logical_cores];
 
     let Some(frequencies) = frequencies else {
         return classes;
     };
+
+    if !allow_frequency_hybrid_classification(vendor) {
+        return classes;
+    }
 
     let mut known_frequencies: Vec<u64> = frequencies.iter().copied().flatten().collect();
     known_frequencies.sort_unstable();
@@ -301,6 +310,28 @@ fn classify_cores(logical_cores: usize, frequencies: Option<&[Option<u64>]>) -> 
     }
 
     classes
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))]
+fn allow_frequency_hybrid_classification(vendor: Option<&str>) -> bool {
+    matches!(vendor, Some("GenuineIntel")) && cpu_reports_intel_hybrid_part()
+}
+
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn allow_frequency_hybrid_classification(_vendor: Option<&str>) -> bool {
+    true
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn cpu_reports_intel_hybrid_part() -> bool {
+    // CPUID.(EAX=7,ECX=0):EDX[15] => Hybrid part.
+    (unsafe { std::arch::x86_64::__cpuid_count(7, 0) }.edx & (1 << 15)) != 0
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86"))]
+fn cpu_reports_intel_hybrid_part() -> bool {
+    // CPUID.(EAX=7,ECX=0):EDX[15] => Hybrid part.
+    (unsafe { std::arch::x86::__cpuid_count(7, 0) }.edx & (1 << 15)) != 0
 }
 
 #[cfg(target_os = "linux")]
