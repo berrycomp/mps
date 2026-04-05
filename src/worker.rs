@@ -1,16 +1,22 @@
 //! Worker bootstrap helpers for the custom MPS physics thread pool.
 //!
-//! The goal of this module is to keep worker threads predictable on Linux:
+//! The goal of this module is to keep worker threads predictable across
+//! Linux and Apple platforms:
 //! - bind each worker to a specific logical core
 //! - apply a per-thread nice value
-//! - provide a low-latency wake primitive backed by futex on Linux
+//! - use futex wake/wait on Linux, condvar wake/wait elsewhere
 //! - avoid `park()` / `unpark()` in the hot path
 
 use crate::topology::CpuClass;
 use std::io;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+#[cfg(not(target_os = "linux"))]
+use std::sync::{Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -116,10 +122,68 @@ fn default_realtime_priority_for_class(class: CpuClass) -> Option<i32> {
 /// something changed before entering a blocking wait. On Linux the blocking
 /// path uses futex, which is substantially lighter than `park()` / `unpark()`
 /// for repeated micro-wakeups.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkerSignal {
     epoch: AtomicU32,
     shutdown_requested: AtomicBool,
+    parking: ParkingPrimitive,
+}
+
+impl Default for WorkerSignal {
+    fn default() -> Self {
+        Self {
+            epoch: AtomicU32::new(0),
+            shutdown_requested: AtomicBool::new(false),
+            parking: ParkingPrimitive::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParkingPrimitive {
+    #[cfg(not(target_os = "linux"))]
+    lock: Mutex<()>,
+    #[cfg(not(target_os = "linux"))]
+    condvar: Condvar,
+}
+
+impl ParkingPrimitive {
+    #[cfg(not(target_os = "linux"))]
+    fn wait_for_change(&self, epoch: &AtomicU32, expected: u32, timeout: Duration) {
+        if epoch.load(Ordering::Acquire) != expected {
+            return;
+        }
+
+        let guard = match self.lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if epoch.load(Ordering::Acquire) != expected {
+            return;
+        }
+
+        let _ = self.condvar.wait_timeout(guard, timeout);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_change(&self, _epoch: &AtomicU32, _expected: u32, _timeout: Duration) {}
+
+    #[cfg(not(target_os = "linux"))]
+    fn wake_one(&self) {
+        self.condvar.notify_one();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wake_one(&self) {}
+
+    #[cfg(not(target_os = "linux"))]
+    fn wake_all(&self) {
+        self.condvar.notify_all();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wake_all(&self) {}
 }
 
 impl WorkerSignal {
@@ -142,13 +206,13 @@ impl WorkerSignal {
     /// Wake at least one sleeping worker.
     pub fn wake_one(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        futex_wake(&self.epoch, 1);
+        futex_wake(&self.epoch, 1, &self.parking);
     }
 
     /// Wake all sleeping workers.
     pub fn wake_all(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
-        futex_wake(&self.epoch, i32::MAX);
+        futex_wake(&self.epoch, i32::MAX, &self.parking);
     }
 
     /// Wait until work becomes visible or shutdown is requested.
@@ -177,7 +241,12 @@ impl WorkerSignal {
         }
 
         let expected = *observed_epoch;
-        futex_wait(&self.epoch, expected, Duration::from_micros(250));
+        futex_wait(
+            &self.epoch,
+            expected,
+            Duration::from_micros(250),
+            &self.parking,
+        );
         *observed_epoch = self.observed_epoch();
     }
 
@@ -197,20 +266,26 @@ where
 {
     let thread_name = launch.thread_name.clone();
     thread::Builder::new().name(thread_name).spawn(move || {
-        let bootstrap = apply_worker_affinity_and_priority(&launch);
         #[cfg(target_os = "linux")]
-        if should_report_bootstrap_error(&launch, &bootstrap) {
-            eprintln!(
-                "[mps worker] '{}' bootstrap affinity={} rt={} nice={} affinity_errno={:?} rt_errno={:?} nice_errno={:?}",
-                launch.thread_name,
-                bootstrap.affinity_applied,
-                bootstrap.realtime_applied,
-                bootstrap.nice_applied,
-                bootstrap.affinity_error,
-                bootstrap.realtime_error,
-                bootstrap.nice_error,
-            );
+        {
+            let bootstrap = apply_worker_affinity_and_priority(&launch);
+            if should_report_bootstrap_error(&launch, &bootstrap) {
+                eprintln!(
+                    "[mps worker] '{}' bootstrap affinity={} rt={} nice={} affinity_errno={:?} rt_errno={:?} nice_errno={:?}",
+                    launch.thread_name,
+                    bootstrap.affinity_applied,
+                    bootstrap.realtime_applied,
+                    bootstrap.nice_applied,
+                    bootstrap.affinity_error,
+                    bootstrap.realtime_error,
+                    bootstrap.nice_error,
+                );
+            }
         }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = apply_worker_affinity_and_priority(&launch);
+
         entry(launch, signal);
     })
 }
@@ -225,7 +300,7 @@ pub fn apply_worker_affinity_and_priority(launch: &WorkerLaunchConfig) -> Worker
             report.last_os_error = Some(errno);
         }
     }
-    match apply_linux_realtime_policy(launch) {
+    match apply_platform_realtime_policy(launch) {
         Ok(()) => report.realtime_applied = true,
         Err(errno) => {
             report.realtime_error = Some(errno);
@@ -382,8 +457,35 @@ fn set_current_thread_nice(nice_value: i32) -> Result<(), i32> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_current_thread_nice(nice_value: i32) -> Result<(), i32> {
+    // Darwin supports per-thread niceness through PRIO_DARWIN_THREAD.
+    const PRIO_DARWIN_THREAD: c_int = 3;
+    let rc = unsafe { setpriority(PRIO_DARWIN_THREAD, 0, nice_value as c_int) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(errno_code())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
 fn set_current_thread_nice(_nice_value: i32) -> Result<(), i32> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_platform_realtime_policy(launch: &WorkerLaunchConfig) -> Result<(), i32> {
+    apply_linux_realtime_policy(launch)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apply_platform_realtime_policy(launch: &WorkerLaunchConfig) -> Result<(), i32> {
+    apply_darwin_qos_policy(launch.class)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn apply_platform_realtime_policy(_launch: &WorkerLaunchConfig) -> Result<(), i32> {
     Ok(())
 }
 
@@ -410,9 +512,19 @@ fn apply_linux_realtime_policy(launch: &WorkerLaunchConfig) -> Result<(), i32> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn apply_linux_realtime_policy(_launch: &WorkerLaunchConfig) -> Result<(), i32> {
-    Ok(())
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apply_darwin_qos_policy(class: CpuClass) -> Result<(), i32> {
+    let qos_class: u32 = match class {
+        CpuClass::Performance => 0x21, // QOS_CLASS_USER_INTERACTIVE
+        CpuClass::Unknown => 0x15,     // QOS_CLASS_DEFAULT
+        CpuClass::Efficient => 0x11,   // QOS_CLASS_UTILITY
+    };
+    let rc = unsafe { pthread_set_qos_class_self_np(qos_class, 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(errno_code())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -420,13 +532,12 @@ fn current_linux_tid() -> libc::pid_t {
     unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t }
 }
 
-#[cfg(target_os = "linux")]
 fn errno_code() -> i32 {
-    unsafe { *libc::__errno_location() }
+    io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
 #[cfg(target_os = "linux")]
-fn futex_wait(epoch: &AtomicU32, expected: u32, timeout: Duration) {
+fn futex_wait(epoch: &AtomicU32, expected: u32, timeout: Duration, _parking: &ParkingPrimitive) {
     let timeout_spec = libc::timespec {
         tv_sec: timeout.as_secs() as libc::time_t,
         tv_nsec: timeout.subsec_nanos() as libc::c_long,
@@ -443,12 +554,12 @@ fn futex_wait(epoch: &AtomicU32, expected: u32, timeout: Duration) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn futex_wait(_epoch: &AtomicU32, _expected: u32, timeout: Duration) {
-    thread::sleep(timeout);
+fn futex_wait(epoch: &AtomicU32, expected: u32, timeout: Duration, parking: &ParkingPrimitive) {
+    parking.wait_for_change(epoch, expected, timeout);
 }
 
 #[cfg(target_os = "linux")]
-fn futex_wake(epoch: &AtomicU32, wake_count: i32) {
+fn futex_wake(epoch: &AtomicU32, wake_count: i32, _parking: &ParkingPrimitive) {
     unsafe {
         let _ = libc::syscall(
             libc::SYS_futex,
@@ -460,4 +571,29 @@ fn futex_wake(epoch: &AtomicU32, wake_count: i32) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn futex_wake(_epoch: &AtomicU32, _wake_count: i32) {}
+fn futex_wake(_epoch: &AtomicU32, wake_count: i32, parking: &ParkingPrimitive) {
+    if wake_count <= 1 {
+        parking.wake_one();
+    } else {
+        parking.wake_all();
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: c_int) -> c_int;
+    fn setpriority(which: c_int, who: c_int, prio: c_int) -> c_int;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerSignal;
+
+    #[test]
+    fn wake_one_advances_epoch_counter() {
+        let signal = WorkerSignal::default();
+        let before = signal.observed_epoch();
+        signal.wake_one();
+        assert_eq!(signal.observed_epoch(), before.wrapping_add(1));
+    }
+}

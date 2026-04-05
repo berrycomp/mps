@@ -17,13 +17,14 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
-// On macOS, apply QoS class to worker threads so the kernel routes them to the
-// correct core cluster (P-cores for interactive work, E-cores for background).
+// On Apple platforms, apply QoS class to worker threads so the kernel routes
+// them to the correct core cluster (P-cores for interactive work, E-cores for
+// background).
 // QoS values come from Apple's <pthread/qos.h>:
 //   QOS_CLASS_USER_INTERACTIVE = 0x21  (highest; preferred on P-cores)
 //   QOS_CLASS_UTILITY          = 0x11  (background-friendly; preferred on E-cores)
 //   QOS_CLASS_DEFAULT          = 0x15  (neutral fallback)
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn apply_thread_qos(class: CpuClass, _core_id: usize) {
     extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
@@ -75,7 +76,7 @@ fn apply_thread_qos(class: CpuClass, core_id: usize) {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
 #[inline(always)]
 fn apply_thread_qos(_class: CpuClass, _core_id: usize) {}
 
@@ -593,7 +594,7 @@ fn worker_loop(
     class_counters: Arc<ClassCounters>,
 ) {
     // Platform-specific thread hints:
-    // - macOS: QoS class so the kernel routes to the right core cluster.
+    // - Apple: QoS class so the kernel routes to the right core cluster.
     // - Linux: sched_setaffinity pins the thread to its core; nice value
     //   gives the scheduler a priority hint.
     apply_thread_qos(worker_class, core_id);
@@ -603,19 +604,22 @@ fn worker_loop(
     // task submission always calls unpark() on a worker, so the upper bound only
     // affects truly idle periods — it does NOT add latency to task pickup.
     //
-    // Apple Silicon (aarch64+macOS): longer caps are safe because the QoS-aware
+    // Apple Silicon (aarch64+Apple): longer caps are safe because the QoS-aware
     // kernel wakes parked threads promptly. E-core workers get a longer upper
     // bound so they stay off the scheduler radar when P-cores have capacity.
     //
-    // x86 macOS: moderate caps — no asymmetric core topology to worry about.
+    // x86 Apple: moderate caps — no asymmetric core topology to worry about.
     //
     // Other platforms: keep original 250 µs floor, modest 2 ms cap.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
     let (idle_park_min, idle_park_max) = match worker_class {
         CpuClass::Efficient => (Duration::from_micros(200), Duration::from_millis(8)),
         _ => (Duration::from_micros(100), Duration::from_millis(4)),
     };
-    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    #[cfg(all(
+        any(target_os = "macos", target_os = "ios"),
+        not(target_arch = "aarch64")
+    ))]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(50), Duration::from_millis(1));
     // Linux desktop: moderate idle backoff. Task submission always calls
     // unpark() so the floor only affects re-check cadence after a spurious
@@ -625,7 +629,7 @@ fn worker_loop(
     // before falling into indefinite park (zero-CPU sleep until unparked).
     #[cfg(target_os = "linux")]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(100), Duration::from_millis(1));
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
     let (idle_park_min, idle_park_max) = (Duration::from_micros(250), Duration::from_millis(2));
 
     // Current adaptive park duration — doubles on each empty poll, reset on task found.

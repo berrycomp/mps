@@ -16,8 +16,8 @@ the hot path.
   double-buffered transform snapshots and lock-free chunk queues.
 - **Runtime-dispatched SIMD kernels** for `Scalar`, `AVX-512`, `NEON`, and
   `VMX/AltiVec`, selected once during scheduler/dispatcher bootstrap.
-- **Linux worker bootstrap controls** with affinity pinning, optional
-  `SCHED_FIFO`, nice-value tuning, and a futex-backed wake signal.
+- **Platform worker bootstrap controls** with Linux affinity/`SCHED_FIFO`,
+  Apple QoS + per-thread nice tuning, and low-latency wake signaling.
 - **Native + WASM task execution** through `MpsScheduler` and `WasmTask`.
 - **Auxiliary payload/key analysis utilities** (`key_decode`, `key_bruteforce`)
   that use the same scheduler infrastructure.
