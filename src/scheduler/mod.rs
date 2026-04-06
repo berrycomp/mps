@@ -411,13 +411,44 @@ impl MpsScheduler {
         preference: CorePreference,
         tasks: Vec<NativeTask>,
     ) -> Vec<TaskId> {
+        self.submit_batch_native_internal(priority, preference, tasks, true)
+    }
+
+    /// Submit native tasks without waking workers.
+    ///
+    /// Useful when batching multiple lanes and waking once after all enqueue
+    /// operations complete to reduce submission-phase jitter.
+    pub fn submit_batch_native_deferred_wake(
+        &self,
+        priority: TaskPriority,
+        preference: CorePreference,
+        tasks: Vec<NativeTask>,
+    ) -> Vec<TaskId> {
+        self.submit_batch_native_internal(priority, preference, tasks, false)
+    }
+
+    fn submit_batch_native_internal(
+        &self,
+        priority: TaskPriority,
+        preference: CorePreference,
+        tasks: Vec<NativeTask>,
+        wake_workers: bool,
+    ) -> Vec<TaskId> {
         let task_count = tasks.len();
+        if task_count == 0 {
+            return Vec::new();
+        }
+
         let mut ids = Vec::with_capacity(task_count);
-        for task in tasks {
-            let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        // Reserve a contiguous task-id range and publish submitted count once.
+        let first_id = self.next_task_id.fetch_add(task_count as u64, Ordering::Relaxed);
+        let queued_base = self.queue.total_len();
+
+        for (offset, task) in tasks.into_iter().enumerate() {
+            let id = first_id + offset as u64;
             let decision = self
                 .balancer
-                .decide(priority, preference, self.queue.total_len());
+                .decide(priority, preference, queued_base.saturating_add(offset));
             let envelope = TaskEnvelope::new(
                 id,
                 priority,
@@ -426,11 +457,14 @@ impl MpsScheduler {
                 TaskPayload::Native(task),
             );
             self.queue.push(envelope);
-            self.submitted.fetch_add(1, Ordering::Relaxed);
             ids.push(id);
         }
 
-        self.wake_n_workers(task_count);
+        self.submitted
+            .fetch_add(task_count as u64, Ordering::Relaxed);
+        if wake_workers {
+            self.wake_n_workers(task_count);
+        }
         ids
     }
 
@@ -441,13 +475,41 @@ impl MpsScheduler {
         preference: CorePreference,
         tasks: Vec<WasmTask>,
     ) -> Vec<TaskId> {
+        self.submit_batch_wasm_internal(priority, preference, tasks, true)
+    }
+
+    /// Submit WASM tasks without waking workers.
+    pub fn submit_batch_wasm_deferred_wake(
+        &self,
+        priority: TaskPriority,
+        preference: CorePreference,
+        tasks: Vec<WasmTask>,
+    ) -> Vec<TaskId> {
+        self.submit_batch_wasm_internal(priority, preference, tasks, false)
+    }
+
+    fn submit_batch_wasm_internal(
+        &self,
+        priority: TaskPriority,
+        preference: CorePreference,
+        tasks: Vec<WasmTask>,
+        wake_workers: bool,
+    ) -> Vec<TaskId> {
         let task_count = tasks.len();
+        if task_count == 0 {
+            return Vec::new();
+        }
+
         let mut ids = Vec::with_capacity(task_count);
-        for task in tasks {
-            let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        // Reserve a contiguous task-id range and publish submitted count once.
+        let first_id = self.next_task_id.fetch_add(task_count as u64, Ordering::Relaxed);
+        let queued_base = self.queue.total_len();
+
+        for (offset, task) in tasks.into_iter().enumerate() {
+            let id = first_id + offset as u64;
             let decision = self
                 .balancer
-                .decide(priority, preference, self.queue.total_len());
+                .decide(priority, preference, queued_base.saturating_add(offset));
             let envelope = TaskEnvelope::new(
                 id,
                 priority,
@@ -456,12 +518,20 @@ impl MpsScheduler {
                 TaskPayload::Wasm(task),
             );
             self.queue.push(envelope);
-            self.submitted.fetch_add(1, Ordering::Relaxed);
             ids.push(id);
         }
 
-        self.wake_n_workers(task_count);
+        self.submitted
+            .fetch_add(task_count as u64, Ordering::Relaxed);
+        if wake_workers {
+            self.wake_n_workers(task_count);
+        }
         ids
+    }
+
+    /// Wake all worker threads once.
+    pub fn wake_all_workers(&self) {
+        self.wake_n_workers(self.worker_threads.len());
     }
 
     /// Wait until the queue is drained or a timeout expires.

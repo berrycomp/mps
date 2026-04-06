@@ -69,7 +69,7 @@ impl LoadBalancer {
 
         let spill_to_any = match priority {
             // Critical tasks stay on preferred cores unless the queue is saturated.
-            TaskPriority::Critical => queued_tasks > self.high_pressure_threshold * 2,
+            TaskPriority::Critical => queued_tasks > self.critical_spill_threshold(),
             TaskPriority::High => true,
             TaskPriority::Normal => true,
             TaskPriority::Background => true,
@@ -105,6 +105,16 @@ impl LoadBalancer {
             CpuClass::Performance if self.topology.performance_cores == 0 => CpuClass::Efficient,
             CpuClass::Efficient if self.topology.efficient_cores == 0 => CpuClass::Performance,
             _ => class,
+        }
+    }
+
+    fn critical_spill_threshold(&self) -> usize {
+        if self.topology.has_hybrid {
+            // On hybrid systems, unlock spill sooner so E-cores can assist
+            // during sustained bursts and avoid long tail-idle periods.
+            self.topology.performance_cores.max(1) * 2
+        } else {
+            self.high_pressure_threshold * 2
         }
     }
 }

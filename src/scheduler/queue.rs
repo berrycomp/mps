@@ -53,12 +53,36 @@ impl PriorityTaskQueue {
                 .performance
                 .pop_high_to_low()
                 .or_else(|| self.shared.pop_high_to_low())
-                .or_else(|| self.steal_with_spill_check(&self.efficient, worker_class)),
+                .or_else(|| {
+                    self.steal_with_spill_check(
+                        &self.efficient,
+                        worker_class,
+                        [
+                            TaskPriority::Critical,
+                            TaskPriority::High,
+                            TaskPriority::Normal,
+                            TaskPriority::Background,
+                        ],
+                    )
+                }),
             CpuClass::Efficient => self
-                .efficient
-                .pop_background_to_critical()
-                .or_else(|| self.shared.pop_high_to_low())
-                .or_else(|| self.steal_with_spill_check(&self.performance, worker_class)),
+                .shared
+                .pop_high_to_low()
+                .or_else(|| {
+                    self.steal_with_spill_check(
+                        &self.performance,
+                        worker_class,
+                        [
+                            // Prefer spillable work first so non-spill critical
+                            // tasks do not block stealing on hybrid systems.
+                            TaskPriority::High,
+                            TaskPriority::Normal,
+                            TaskPriority::Background,
+                            TaskPriority::Critical,
+                        ],
+                    )
+                })
+                .or_else(|| self.efficient.pop_background_to_critical()),
             CpuClass::Unknown => self
                 .shared
                 .pop_high_to_low()
@@ -94,10 +118,11 @@ impl PriorityTaskQueue {
         &self,
         source: &LaneQueue,
         worker_class: CpuClass,
+        steal_order: [TaskPriority; 4],
     ) -> Option<TaskEnvelope> {
         // Bound retry count to avoid endless churn when only non-spill tasks exist.
         for _ in 0..4 {
-            let task = source.pop_high_to_low()?;
+            let task = source.pop_in_order(steal_order)?;
             if task.spill_to_any
                 || task.preferred_class == CpuClass::Unknown
                 || task.preferred_class == worker_class
@@ -110,6 +135,51 @@ impl PriorityTaskQueue {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::TaskPayload;
+
+    fn noop_payload() -> TaskPayload {
+        TaskPayload::Native(Box::new(|| {}))
+    }
+
+    #[test]
+    fn efficient_steal_skips_non_spill_critical_barrier() {
+        let queue = PriorityTaskQueue::new();
+
+        queue.push(TaskEnvelope::new(
+            1,
+            TaskPriority::Critical,
+            CpuClass::Performance,
+            false,
+            noop_payload(),
+        ));
+        queue.push(TaskEnvelope::new(
+            2,
+            TaskPriority::Critical,
+            CpuClass::Performance,
+            false,
+            noop_payload(),
+        ));
+        queue.push(TaskEnvelope::new(
+            3,
+            TaskPriority::High,
+            CpuClass::Performance,
+            true,
+            noop_payload(),
+        ));
+
+        let stolen = queue
+            .pop_for_worker(CpuClass::Efficient)
+            .expect("efficient worker should steal spillable high task");
+
+        assert_eq!(stolen.priority, TaskPriority::High);
+        assert!(stolen.spill_to_any);
+        assert_eq!(queue.total_len(), 2);
     }
 }
 
