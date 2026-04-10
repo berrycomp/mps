@@ -1,6 +1,7 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
-    float32x4_t, vaddq_f32, vfmaq_f32, vdupq_n_f32, vld1q_f32, vst1q_f32, vsubq_f32,
+    float32x4_t, uint32x4_t, vaddq_f32, vandq_u32, vcgeq_f32, vcleq_f32, vdupq_n_f32, vfmaq_f32,
+    vld1q_f32, vshrq_n_u32, vst1q_f32, vst1q_u32, vsubq_f32,
 };
 
 const LANES: usize = 4;
@@ -143,6 +144,74 @@ pub(crate) unsafe fn aabb_min_max(
         max_x.add(index),
         max_y.add(index),
         max_z.add(index),
+        len - index,
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn aabb_overlap_mask(
+    a_min_x: *const f32,
+    a_min_y: *const f32,
+    a_min_z: *const f32,
+    a_max_x: *const f32,
+    a_max_y: *const f32,
+    a_max_z: *const f32,
+    b_min_x: *const f32,
+    b_min_y: *const f32,
+    b_min_z: *const f32,
+    b_max_x: *const f32,
+    b_max_y: *const f32,
+    b_max_z: *const f32,
+    out_mask: *mut u32,
+    len: usize,
+) {
+    let mut index = 0;
+    while index + LANES <= len {
+        let ax_min = vld1q_f32(a_min_x.add(index));
+        let ay_min = vld1q_f32(a_min_y.add(index));
+        let az_min = vld1q_f32(a_min_z.add(index));
+        let ax_max = vld1q_f32(a_max_x.add(index));
+        let ay_max = vld1q_f32(a_max_y.add(index));
+        let az_max = vld1q_f32(a_max_z.add(index));
+
+        let bx_min = vld1q_f32(b_min_x.add(index));
+        let by_min = vld1q_f32(b_min_y.add(index));
+        let bz_min = vld1q_f32(b_min_z.add(index));
+        let bx_max = vld1q_f32(b_max_x.add(index));
+        let by_max = vld1q_f32(b_max_y.add(index));
+        let bz_max = vld1q_f32(b_max_z.add(index));
+
+        let x_le = vcleq_f32(ax_min, bx_max);
+        let x_ge = vcgeq_f32(ax_max, bx_min);
+        let y_le = vcleq_f32(ay_min, by_max);
+        let y_ge = vcgeq_f32(ay_max, by_min);
+        let z_le = vcleq_f32(az_min, bz_max);
+        let z_ge = vcgeq_f32(az_max, bz_min);
+        let overlap_mask: uint32x4_t = vandq_u32(
+            vandq_u32(x_le, x_ge),
+            vandq_u32(vandq_u32(y_le, y_ge), vandq_u32(z_le, z_ge)),
+        );
+        let normalized = vshrq_n_u32(overlap_mask, 31);
+        vst1q_u32(out_mask.add(index), normalized);
+        index += LANES;
+    }
+
+    crate::simd::scalar::aabb_overlap_mask(
+        a_min_x.add(index),
+        a_min_y.add(index),
+        a_min_z.add(index),
+        a_max_x.add(index),
+        a_max_y.add(index),
+        a_max_z.add(index),
+        b_min_x.add(index),
+        b_min_y.add(index),
+        b_min_z.add(index),
+        b_max_x.add(index),
+        b_max_y.add(index),
+        b_max_z.add(index),
+        out_mask.add(index),
         len - index,
     );
 }

@@ -150,16 +150,8 @@ type CopyTransformSoaFn = unsafe fn(
     usize,
 );
 
-type IntegratePositionsFn = unsafe fn(
-    *mut f32,
-    *mut f32,
-    *mut f32,
-    *const f32,
-    *const f32,
-    *const f32,
-    f32,
-    usize,
-);
+type IntegratePositionsFn =
+    unsafe fn(*mut f32, *mut f32, *mut f32, *const f32, *const f32, *const f32, f32, usize);
 
 type AabbMinMaxFn = unsafe fn(
     *const f32,
@@ -245,7 +237,7 @@ impl SimdKernelSet {
                 copy_transform_soa_fn: x86_64_avx512::copy_transform_soa,
                 integrate_positions_fn: x86_64_avx512::integrate_positions,
                 aabb_min_max_fn: x86_64_avx512::aabb_min_max,
-                aabb_overlap_mask_fn: scalar::aabb_overlap_mask,
+                aabb_overlap_mask_fn: x86_64_avx512::aabb_overlap_mask,
             },
             #[cfg(target_arch = "aarch64")]
             SimdBackendKind::Aarch64Neon => Self {
@@ -253,7 +245,7 @@ impl SimdKernelSet {
                 copy_transform_soa_fn: aarch64_neon::copy_transform_soa,
                 integrate_positions_fn: aarch64_neon::integrate_positions,
                 aabb_min_max_fn: aarch64_neon::aabb_min_max,
-                aabb_overlap_mask_fn: scalar::aabb_overlap_mask,
+                aabb_overlap_mask_fn: aarch64_neon::aabb_overlap_mask,
             },
             #[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
             SimdBackendKind::PowerPcAltivec => Self {
@@ -284,7 +276,11 @@ impl SimdKernelSet {
     }
 
     /// Copy a transform SoA batch from `src` to `dst`.
-    pub fn copy_transform_soa(&self, dst: &mut TransformSoaMut<'_>, src: TransformSoaRef<'_>) -> usize {
+    pub fn copy_transform_soa(
+        &self,
+        dst: &mut TransformSoaMut<'_>,
+        src: TransformSoaRef<'_>,
+    ) -> usize {
         let len = min_transform_len_mut(dst, &src);
         if len == 0 {
             return 0;
@@ -527,7 +523,11 @@ fn min_aabb_input_len(dst: &AabbBoundsSoaMut<'_>, src: &AabbInputSoaRef<'_>) -> 
         .min(src.half_z.len())
 }
 
-fn min_aabb_overlap_len(a: &AabbBoundsSoaRef<'_>, b: &AabbBoundsSoaRef<'_>, output: &[u32]) -> usize {
+fn min_aabb_overlap_len(
+    a: &AabbBoundsSoaRef<'_>,
+    b: &AabbBoundsSoaRef<'_>,
+    output: &[u32],
+) -> usize {
     output
         .len()
         .min(a.min_x.len())
@@ -675,5 +675,92 @@ mod tests {
             | SimdBackendKind::Aarch64Neon
             | SimdBackendKind::PowerPcAltivec => {}
         }
+    }
+
+    #[test]
+    fn runtime_dispatch_aabb_overlap_mask_produces_binary_expected_values() {
+        let kernels = SimdKernelSet::detect_runtime();
+        let len = kernels.lanes_f32().max(17);
+        let center: Vec<f32> = (0..len).map(|index| index as f32).collect();
+        let half = vec![0.5_f32; len];
+
+        let mut a_min_x = vec![0.0_f32; len];
+        let mut a_min_y = vec![0.0_f32; len];
+        let mut a_min_z = vec![0.0_f32; len];
+        let mut a_max_x = vec![0.0_f32; len];
+        let mut a_max_y = vec![0.0_f32; len];
+        let mut a_max_z = vec![0.0_f32; len];
+        let written = kernels.aabb_min_max(
+            &mut AabbBoundsSoaMut {
+                min_x: &mut a_min_x,
+                min_y: &mut a_min_y,
+                min_z: &mut a_min_z,
+                max_x: &mut a_max_x,
+                max_y: &mut a_max_y,
+                max_z: &mut a_max_z,
+            },
+            AabbInputSoaRef {
+                center_x: &center,
+                center_y: &center,
+                center_z: &center,
+                half_x: &half,
+                half_y: &half,
+                half_z: &half,
+            },
+        );
+        assert_eq!(written, len);
+
+        let mut b_min_x = vec![0.0_f32; len];
+        let mut b_min_y = vec![0.0_f32; len];
+        let mut b_min_z = vec![0.0_f32; len];
+        let mut b_max_x = vec![0.0_f32; len];
+        let mut b_max_y = vec![0.0_f32; len];
+        let mut b_max_z = vec![0.0_f32; len];
+        let mut expected = vec![0_u32; len];
+
+        for index in 0..len {
+            let c = center[index];
+            if index % 2 == 0 {
+                // Even lanes overlap with A by construction.
+                b_min_x[index] = c - 0.25;
+                b_min_y[index] = c - 0.25;
+                b_min_z[index] = c - 0.25;
+                b_max_x[index] = c + 0.25;
+                b_max_y[index] = c + 0.25;
+                b_max_z[index] = c + 0.25;
+                expected[index] = 1;
+            } else {
+                // Odd lanes are fully separated from A.
+                b_min_x[index] = c + 2.0;
+                b_min_y[index] = c + 2.0;
+                b_min_z[index] = c + 2.0;
+                b_max_x[index] = c + 3.0;
+                b_max_y[index] = c + 3.0;
+                b_max_z[index] = c + 3.0;
+            }
+        }
+
+        let mut mask = vec![0_u32; len];
+        let tested = kernels.aabb_overlap_mask(
+            AabbBoundsSoaRef {
+                min_x: &a_min_x,
+                min_y: &a_min_y,
+                min_z: &a_min_z,
+                max_x: &a_max_x,
+                max_y: &a_max_y,
+                max_z: &a_max_z,
+            },
+            AabbBoundsSoaRef {
+                min_x: &b_min_x,
+                min_y: &b_min_y,
+                min_z: &b_min_z,
+                max_x: &b_max_x,
+                max_y: &b_max_y,
+                max_z: &b_max_z,
+            },
+            &mut mask,
+        );
+        assert_eq!(tested, len);
+        assert_eq!(mask, expected);
     }
 }

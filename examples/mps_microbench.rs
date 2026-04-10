@@ -1,7 +1,7 @@
 use mps::{
-    ClassExecutionMetrics, CorePreference, MpsScheduler, NativeTask, SchedulerMetrics,
-    TaskPriority,
+    ClassExecutionMetrics, CorePreference, MpsScheduler, NativeTask, SchedulerMetrics, TaskPriority,
 };
+use std::fmt::Write as _;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ const DEFAULT_WARMUP_RUNS: usize = 2;
 const DEFAULT_MEASURED_RUNS: usize = 7;
 const DEFAULT_TASKS_PER_CORE: usize = 240;
 const DEFAULT_ITER_SCALE: u64 = 4;
+const DEFAULT_OUTPUT_JSON: bool = false;
 const PARK_SETTLE_MS: u64 = 5;
 
 #[derive(Debug, Clone, Copy)]
@@ -18,17 +19,18 @@ struct BenchConfig {
     measured_runs: usize,
     tasks_per_core: usize,
     iter_scale: u64,
+    output_json: bool,
 }
 
 impl BenchConfig {
     fn from_env() -> Self {
         Self {
             warmup_runs: parse_env_usize("MPS_BENCH_WARMUP_RUNS", DEFAULT_WARMUP_RUNS),
-            measured_runs: parse_env_usize("MPS_BENCH_MEASURED_RUNS", DEFAULT_MEASURED_RUNS)
-                .max(1),
+            measured_runs: parse_env_usize("MPS_BENCH_MEASURED_RUNS", DEFAULT_MEASURED_RUNS).max(1),
             tasks_per_core: parse_env_usize("MPS_BENCH_TASKS_PER_CORE", DEFAULT_TASKS_PER_CORE)
                 .max(1),
             iter_scale: parse_env_u64("MPS_BENCH_ITER_SCALE", DEFAULT_ITER_SCALE).max(1),
+            output_json: parse_env_bool("MPS_BENCH_OUTPUT_JSON", DEFAULT_OUTPUT_JSON),
         }
     }
 }
@@ -84,6 +86,7 @@ struct Stats {
     max: f64,
     stddev: f64,
     cv_pct: f64,
+    p95: f64,
 }
 
 fn main() {
@@ -108,8 +111,12 @@ fn main() {
         counts.critical, counts.high, counts.normal, counts.background
     );
     println!(
-        "Config => warmup: {}, measured: {}, tasks/core: {}, iter-scale: {}",
-        config.warmup_runs, config.measured_runs, config.tasks_per_core, config.iter_scale
+        "Config => warmup: {}, measured: {}, tasks/core: {}, iter-scale: {}, json: {}",
+        config.warmup_runs,
+        config.measured_runs,
+        config.tasks_per_core,
+        config.iter_scale,
+        config.output_json
     );
 
     let effective_cores = effective_core_capacity(topology);
@@ -117,7 +124,13 @@ fn main() {
     let mut samples = Vec::with_capacity(config.measured_runs);
 
     for run in 0..total_runs {
-        let sample = run_once(&scheduler, topology, counts, config.iter_scale, effective_cores);
+        let sample = run_once(
+            &scheduler,
+            topology,
+            counts,
+            config.iter_scale,
+            effective_cores,
+        );
         let is_warmup = run < config.warmup_runs;
         let run_no = if is_warmup {
             run + 1
@@ -148,7 +161,7 @@ fn main() {
         return;
     }
 
-    print_summary(&samples);
+    print_summary(&samples, config);
 }
 
 fn run_once(
@@ -228,9 +241,12 @@ fn run_once(
     }
 }
 
-fn print_summary(samples: &[BenchSample]) {
+fn print_summary(samples: &[BenchSample], config: BenchConfig) {
     let elapsed_values: Vec<f64> = samples.iter().map(|sample| sample.elapsed_ms).collect();
-    let score_values: Vec<f64> = samples.iter().map(|sample| sample.score.score as f64).collect();
+    let score_values: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.score.score as f64)
+        .collect();
     let tasks_per_sec_values: Vec<f64> = samples
         .iter()
         .map(|sample| sample.score.tasks_per_sec)
@@ -284,19 +300,25 @@ fn print_summary(samples: &[BenchSample]) {
         elapsed_stats.cv_pct, parallel_raw_stats.cv_pct, gflops_stats.cv_pct
     );
     println!(
-        "Elapsed(ms) => mean: {:.3}, median: {:.3}, min: {:.3}, max: {:.3}, stddev: {:.3}",
+        "Elapsed(ms) => mean: {:.3}, median: {:.3}, min: {:.3}, max: {:.3}, stddev: {:.3}, p95: {:.3}",
         elapsed_stats.mean,
         elapsed_stats.median,
         elapsed_stats.min,
         elapsed_stats.max,
-        elapsed_stats.stddev
+        elapsed_stats.stddev,
+        elapsed_stats.p95
     );
-    println!("Multicore score => {} [{}]", median_score, score_tier(median_score));
     println!(
-        "Throughput => tasks/s: {:.0}, work units/s: {:.2}M, gflops: {:.2}",
+        "Multicore score => {} [{}]",
+        median_score,
+        score_tier(median_score)
+    );
+    println!(
+        "Throughput => tasks/s: {:.0}, work units/s: {:.2}M, gflops: {:.2} (p95: {:.2})",
         tasks_stats.median,
         work_units_stats.median / 1_000_000.0,
-        gflops_stats.median
+        gflops_stats.median,
+        gflops_stats.p95
     );
     println!(
         "Efficiency => parallel(raw): {:.2}%, parallel(norm): {:.2}%, E-core share: {:.2}%",
@@ -306,6 +328,21 @@ fn print_summary(samples: &[BenchSample]) {
         "Class runtime(ms) => P: {:.3}, E: {:.3}, U: {:.3}",
         p_runtime_stats.median, e_runtime_stats.median, u_runtime_stats.median
     );
+
+    if config.output_json {
+        emit_json_summary(
+            config,
+            samples,
+            elapsed_stats,
+            score_stats,
+            tasks_stats,
+            work_units_stats,
+            gflops_stats,
+            parallel_raw_stats,
+            parallel_stats,
+            e_share_stats,
+        );
+    }
 }
 
 fn summarize(values: &[f64]) -> Stats {
@@ -338,6 +375,7 @@ fn summarize(values: &[f64]) -> Stats {
     } else {
         (stddev / mean) * 100.0
     };
+    let p95 = percentile_sorted(&sorted, 0.95);
 
     Stats {
         mean,
@@ -346,7 +384,99 @@ fn summarize(values: &[f64]) -> Stats {
         max,
         stddev,
         cv_pct,
+        p95,
     }
+}
+
+fn percentile_sorted(sorted: &[f64], percentile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let clamped = percentile.clamp(0.0, 1.0);
+    let rank = clamped * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted[lower];
+    }
+    let frac = rank - lower as f64;
+    sorted[lower] + (sorted[upper] - sorted[lower]) * frac
+}
+
+fn emit_json_summary(
+    config: BenchConfig,
+    samples: &[BenchSample],
+    elapsed_stats: Stats,
+    score_stats: Stats,
+    tasks_stats: Stats,
+    work_units_stats: Stats,
+    gflops_stats: Stats,
+    parallel_raw_stats: Stats,
+    parallel_stats: Stats,
+    e_share_stats: Stats,
+) {
+    let median_score = score_stats.median.round().max(0.0) as u64;
+    let mut json = String::new();
+
+    let _ = write!(
+        &mut json,
+        "{{\"schema\":\"mps_microbench.v1\",\"config\":{{\"warmup_runs\":{},\"measured_runs\":{},\"tasks_per_core\":{},\"iter_scale\":{}}},",
+        config.warmup_runs, config.measured_runs, config.tasks_per_core, config.iter_scale
+    );
+
+    json.push_str("\"summary\":{");
+    let _ = write!(
+        &mut json,
+        "\"multicore_score_median\":{},\"multicore_tier\":\"{}\",",
+        median_score,
+        score_tier(median_score)
+    );
+    append_stats_json(&mut json, "elapsed_ms", elapsed_stats);
+    json.push(',');
+    append_stats_json(&mut json, "tasks_per_sec", tasks_stats);
+    json.push(',');
+    append_stats_json(&mut json, "work_units_per_sec", work_units_stats);
+    json.push(',');
+    append_stats_json(&mut json, "gflops", gflops_stats);
+    json.push(',');
+    append_stats_json(&mut json, "parallel_raw_pct", parallel_raw_stats);
+    json.push(',');
+    append_stats_json(&mut json, "parallel_norm_pct", parallel_stats);
+    json.push(',');
+    append_stats_json(&mut json, "e_core_share_pct", e_share_stats);
+    json.push('}');
+
+    json.push_str(",\"samples\":[");
+    for (index, sample) in samples.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        let _ = write!(
+            &mut json,
+            "{{\"run\":{},\"idle\":{},\"elapsed_ms\":{:.6},\"score\":{},\"parallel_raw_pct\":{:.6},\"parallel_norm_pct\":{:.6},\"gflops\":{:.6},\"e_core_share_pct\":{:.6}}}",
+            index + 1,
+            sample.idle,
+            sample.elapsed_ms,
+            sample.score.score,
+            sample.score.parallel_efficiency_raw_pct,
+            sample.score.parallel_efficiency_pct,
+            sample.score.gflops,
+            sample.score.e_core_share_pct
+        );
+    }
+    json.push_str("]}");
+    println!("{json}");
+}
+
+fn append_stats_json(json: &mut String, key: &str, stats: Stats) {
+    let _ = write!(
+        json,
+        "\"{key}\":{{\"mean\":{:.6},\"median\":{:.6},\"min\":{:.6},\"max\":{:.6},\"stddev\":{:.6},\"cv_pct\":{:.6},\"p95\":{:.6}}}",
+        stats.mean, stats.median, stats.min, stats.max, stats.stddev, stats.cv_pct, stats.p95
+    );
 }
 
 fn metrics_delta(after: SchedulerMetrics, before: SchedulerMetrics) -> SchedulerMetrics {
@@ -369,7 +499,9 @@ fn class_metrics_delta(
 ) -> ClassExecutionMetrics {
     ClassExecutionMetrics {
         executed_tasks: after.executed_tasks.saturating_sub(before.executed_tasks),
-        execution_time_ns: after.execution_time_ns.saturating_sub(before.execution_time_ns),
+        execution_time_ns: after
+            .execution_time_ns
+            .saturating_sub(before.execution_time_ns),
     }
 }
 
@@ -508,4 +640,15 @@ fn parse_env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    let Some(raw) = std::env::var(key).ok() else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
 }

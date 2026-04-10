@@ -32,6 +32,15 @@ repository tag:
 mps = { git = "https://github.com/berrycomp/mps", tag = "v0.5.5" }
 ```
 
+## Documentation
+
+Detailed docs are available in [`docs/`](docs/README.md):
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Performance and Benchmarking](docs/PERFORMANCE_BENCHMARKS.md)
+- [Platform Tuning](docs/PLATFORM_TUNING.md)
+- [Release Checklist](docs/RELEASE_CHECKLIST.md)
+
 ## Quick Start: Priority Scheduler
 
 ```rust
@@ -193,6 +202,10 @@ back safely if not.
 - `TILELINE_MPS_PRIVILEGED_SCHED=0` forces the unprivileged path.
 - `MPS_SIMD_FORCE_SCALAR=1` disables AVX-512 / NEON / AltiVec dispatch and pins
   `SimdKernelSet` to the scalar backend for reproducibility or debugging.
+- `MPS_IDLE_PRE_PARK_SPINS` / `MPS_IDLE_PRE_PARK_YIELDS` tune short idle
+  pre-park probing before workers transition into timeout/indefinite park.
+- `MPS_IDLE_PARK_MIN_US` / `MPS_IDLE_PARK_MAX_US` tune adaptive worker park
+  timeout bounds for jitter/latency trade-offs.
 
 On regular unprivileged Linux sessions, affinity usually still applies, while
 real-time policy / negative nice requests are automatically normalized away.
@@ -204,6 +217,7 @@ cargo run --example mps_microbench
 cargo run --example wasm_task_demo
 cargo run --example strict_key_decode -- key.txt
 cargo run --example payload_bruteforce -- key.txt candidate_keys.txt
+MPS_BENCH_OUTPUT_JSON=1 cargo run --release --example mps_microbench
 ```
 
 ## Status and Boundaries
@@ -212,8 +226,9 @@ cargo run --example payload_bruteforce -- key.txt candidate_keys.txt
   integrations.
 - `MpsThreadPool` stays available as a simpler compatibility layer while
   callers migrate.
-- AVX-512 / NEON / AltiVec dispatch is selected at bootstrap, but non-scalar
-  `aabb_overlap_mask` currently falls back to the scalar helper.
+- AVX-512 / NEON / AltiVec dispatch is selected at bootstrap. `aabb_overlap_mask`
+  is vectorized on AVX-512 + NEON; AltiVec currently keeps scalar fallback for
+  this helper.
 - The key/payload utilities are intentionally shipped as auxiliary tooling, not
   as the core runtime API.
 

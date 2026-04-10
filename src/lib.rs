@@ -47,9 +47,9 @@ pub use scheduler::{
     WasmTask,
 };
 pub use simd::{
-    detect_runtime_simd, AabbBoundsSoaMut, AabbBoundsSoaRef, AabbInputSoaRef,
-    PositionSoaMut, SimdBackendKind, SimdCapabilities, SimdKernelSet, TransformSoaMut,
-    TransformSoaRef, VelocitySoaRef,
+    detect_runtime_simd, AabbBoundsSoaMut, AabbBoundsSoaRef, AabbInputSoaRef, PositionSoaMut,
+    SimdBackendKind, SimdCapabilities, SimdKernelSet, TransformSoaMut, TransformSoaRef,
+    VelocitySoaRef,
 };
 pub use thread_pool::{
     DoubleBufferedTransformStorage, MpsThreadPool, MpsThreadPoolConfig, MpsThreadPoolMetrics,

@@ -1,7 +1,7 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    _mm512_add_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_set1_ps, _mm512_storeu_ps,
-    _mm512_sub_ps,
+    _mm512_add_ps, _mm512_cmp_ps_mask, _mm512_loadu_ps, _mm512_mul_ps, _mm512_set1_ps,
+    _mm512_storeu_ps, _mm512_sub_ps, _CMP_GE_OQ, _CMP_LE_OQ,
 };
 
 const LANES: usize = 16;
@@ -79,9 +79,18 @@ pub(crate) unsafe fn integrate_positions(
         let vy = _mm512_loadu_ps(velocity_y.add(index));
         let vz = _mm512_loadu_ps(velocity_z.add(index));
 
-        _mm512_storeu_ps(position_x.add(index), _mm512_add_ps(px, _mm512_mul_ps(vx, dt)));
-        _mm512_storeu_ps(position_y.add(index), _mm512_add_ps(py, _mm512_mul_ps(vy, dt)));
-        _mm512_storeu_ps(position_z.add(index), _mm512_add_ps(pz, _mm512_mul_ps(vz, dt)));
+        _mm512_storeu_ps(
+            position_x.add(index),
+            _mm512_add_ps(px, _mm512_mul_ps(vx, dt)),
+        );
+        _mm512_storeu_ps(
+            position_y.add(index),
+            _mm512_add_ps(py, _mm512_mul_ps(vy, dt)),
+        );
+        _mm512_storeu_ps(
+            position_z.add(index),
+            _mm512_add_ps(pz, _mm512_mul_ps(vz, dt)),
+        );
         index += LANES;
     }
     crate::simd::scalar::integrate_positions(
@@ -144,6 +153,73 @@ pub(crate) unsafe fn aabb_min_max(
         max_x.add(index),
         max_y.add(index),
         max_z.add(index),
+        len - index,
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn aabb_overlap_mask(
+    a_min_x: *const f32,
+    a_min_y: *const f32,
+    a_min_z: *const f32,
+    a_max_x: *const f32,
+    a_max_y: *const f32,
+    a_max_z: *const f32,
+    b_min_x: *const f32,
+    b_min_y: *const f32,
+    b_min_z: *const f32,
+    b_max_x: *const f32,
+    b_max_y: *const f32,
+    b_max_z: *const f32,
+    out_mask: *mut u32,
+    len: usize,
+) {
+    let mut index = 0;
+    while index + LANES <= len {
+        let ax_min = _mm512_loadu_ps(a_min_x.add(index));
+        let ay_min = _mm512_loadu_ps(a_min_y.add(index));
+        let az_min = _mm512_loadu_ps(a_min_z.add(index));
+        let ax_max = _mm512_loadu_ps(a_max_x.add(index));
+        let ay_max = _mm512_loadu_ps(a_max_y.add(index));
+        let az_max = _mm512_loadu_ps(a_max_z.add(index));
+
+        let bx_min = _mm512_loadu_ps(b_min_x.add(index));
+        let by_min = _mm512_loadu_ps(b_min_y.add(index));
+        let bz_min = _mm512_loadu_ps(b_min_z.add(index));
+        let bx_max = _mm512_loadu_ps(b_max_x.add(index));
+        let by_max = _mm512_loadu_ps(b_max_y.add(index));
+        let bz_max = _mm512_loadu_ps(b_max_z.add(index));
+
+        let x_le = _mm512_cmp_ps_mask(ax_min, bx_max, _CMP_LE_OQ);
+        let x_ge = _mm512_cmp_ps_mask(ax_max, bx_min, _CMP_GE_OQ);
+        let y_le = _mm512_cmp_ps_mask(ay_min, by_max, _CMP_LE_OQ);
+        let y_ge = _mm512_cmp_ps_mask(ay_max, by_min, _CMP_GE_OQ);
+        let z_le = _mm512_cmp_ps_mask(az_min, bz_max, _CMP_LE_OQ);
+        let z_ge = _mm512_cmp_ps_mask(az_max, bz_min, _CMP_GE_OQ);
+        let overlap_mask = x_le & x_ge & y_le & y_ge & z_le & z_ge;
+
+        for lane in 0..LANES {
+            *out_mask.add(index + lane) = ((overlap_mask >> lane) & 1) as u32;
+        }
+        index += LANES;
+    }
+
+    crate::simd::scalar::aabb_overlap_mask(
+        a_min_x.add(index),
+        a_min_y.add(index),
+        a_min_z.add(index),
+        a_max_x.add(index),
+        a_max_y.add(index),
+        a_max_z.add(index),
+        b_min_x.add(index),
+        b_min_y.add(index),
+        b_min_z.add(index),
+        b_max_x.add(index),
+        b_max_y.add(index),
+        b_max_z.add(index),
+        out_mask.add(index),
         len - index,
     );
 }

@@ -102,6 +102,54 @@ fn linux_errno() -> i32 {
 #[inline(always)]
 fn apply_thread_qos(_class: CpuClass, _core_id: usize) {}
 
+#[derive(Debug, Clone, Copy)]
+struct WorkerIdlePolicy {
+    pre_park_spins: u32,
+    pre_park_yields: u32,
+    park_min: Duration,
+    park_max: Duration,
+}
+
+fn worker_idle_policy(worker_class: CpuClass) -> WorkerIdlePolicy {
+    #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    let (default_park_min, default_park_max) = match worker_class {
+        CpuClass::Efficient => (Duration::from_micros(200), Duration::from_millis(8)),
+        _ => (Duration::from_micros(100), Duration::from_millis(4)),
+    };
+    #[cfg(all(
+        any(target_os = "macos", target_os = "ios"),
+        not(target_arch = "aarch64")
+    ))]
+    let (default_park_min, default_park_max) =
+        (Duration::from_micros(50), Duration::from_millis(1));
+    #[cfg(target_os = "linux")]
+    let (default_park_min, default_park_max) =
+        (Duration::from_micros(100), Duration::from_millis(1));
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    let (default_park_min, default_park_max) =
+        (Duration::from_micros(250), Duration::from_millis(2));
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let (default_pre_park_spins, default_pre_park_yields) = (96, 24);
+    #[cfg(target_os = "linux")]
+    let (default_pre_park_spins, default_pre_park_yields) = (64, 16);
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    let (default_pre_park_spins, default_pre_park_yields) = (32, 8);
+
+    let park_min = parse_env_duration_micros("MPS_IDLE_PARK_MIN_US").unwrap_or(default_park_min);
+    let park_max = parse_env_duration_micros("MPS_IDLE_PARK_MAX_US")
+        .unwrap_or(default_park_max)
+        .max(park_min);
+
+    WorkerIdlePolicy {
+        pre_park_spins: parse_env_u32("MPS_IDLE_PRE_PARK_SPINS").unwrap_or(default_pre_park_spins),
+        pre_park_yields: parse_env_u32("MPS_IDLE_PRE_PARK_YIELDS")
+            .unwrap_or(default_pre_park_yields),
+        park_min,
+        park_max,
+    }
+}
+
 pub use dispatcher::{
     CompletedPhysicsFrame, DispatchError, DispatchResult, Dispatcher,
     DispatcherDoubleBufferedTransforms, DispatcherPhase, DispatcherPhaseCallbacks,
@@ -441,14 +489,16 @@ impl MpsScheduler {
 
         let mut ids = Vec::with_capacity(task_count);
         // Reserve a contiguous task-id range and publish submitted count once.
-        let first_id = self.next_task_id.fetch_add(task_count as u64, Ordering::Relaxed);
+        let first_id = self
+            .next_task_id
+            .fetch_add(task_count as u64, Ordering::Relaxed);
         let queued_base = self.queue.total_len();
 
         for (offset, task) in tasks.into_iter().enumerate() {
             let id = first_id + offset as u64;
-            let decision = self
-                .balancer
-                .decide(priority, preference, queued_base.saturating_add(offset));
+            let decision =
+                self.balancer
+                    .decide(priority, preference, queued_base.saturating_add(offset));
             let envelope = TaskEnvelope::new(
                 id,
                 priority,
@@ -502,14 +552,16 @@ impl MpsScheduler {
 
         let mut ids = Vec::with_capacity(task_count);
         // Reserve a contiguous task-id range and publish submitted count once.
-        let first_id = self.next_task_id.fetch_add(task_count as u64, Ordering::Relaxed);
+        let first_id = self
+            .next_task_id
+            .fetch_add(task_count as u64, Ordering::Relaxed);
         let queued_base = self.queue.total_len();
 
         for (offset, task) in tasks.into_iter().enumerate() {
             let id = first_id + offset as u64;
-            let decision = self
-                .balancer
-                .decide(priority, preference, queued_base.saturating_add(offset));
+            let decision =
+                self.balancer
+                    .decide(priority, preference, queued_base.saturating_add(offset));
             let envelope = TaskEnvelope::new(
                 id,
                 priority,
@@ -538,22 +590,35 @@ impl MpsScheduler {
     pub fn wait_for_idle(&self, timeout: Duration) -> bool {
         let started = Instant::now();
         let mut spin_loops = 0u32;
+        let worker_count = self.worker_threads.len().max(1);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let mut sleep_step = Duration::from_micros(25);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let mut sleep_step = Duration::from_micros(50);
         while started.elapsed() <= timeout {
             let submitted = self.submitted.load(Ordering::Acquire);
             let finished =
                 self.completed.load(Ordering::Acquire) + self.failed.load(Ordering::Acquire);
-            if self.queue.is_empty() && finished >= submitted {
+            let pending_tasks = submitted.saturating_sub(finished) as usize;
+            let queue_len = self.queue.total_len();
+            if queue_len == 0 && finished >= submitted {
                 return true;
             }
 
-            if spin_loops < 256 {
+            let backlog = pending_tasks.max(queue_len);
+            let backlog_per_worker =
+                backlog.saturating_add(worker_count.saturating_sub(1)) / worker_count;
+            let backlog_scale = backlog_per_worker.clamp(1, 16) as u32;
+            let spin_limit = (128u32.saturating_mul(backlog_scale)).min(2_048);
+            let yield_limit = spin_limit + (384u32.saturating_mul(backlog_scale)).min(4_096);
+
+            if spin_loops < spin_limit {
                 spin_loops += 1;
                 std::hint::spin_loop();
                 continue;
             }
 
-            if spin_loops < 1024 {
+            if spin_loops < yield_limit {
                 spin_loops += 1;
                 thread::yield_now();
                 continue;
@@ -565,6 +630,7 @@ impl MpsScheduler {
             }
 
             thread::sleep(sleep_step.min(remaining));
+            spin_loops = 0;
             sleep_step = (sleep_step * 2).min(Duration::from_millis(1));
         }
         false
@@ -734,46 +800,21 @@ fn worker_loop(
     //   gives the scheduler a priority hint.
     apply_thread_qos(worker_class, core_id);
 
-    // Adaptive idle park bounds by platform and core class.
-    //
-    // task submission always calls unpark() on a worker, so the upper bound only
-    // affects truly idle periods — it does NOT add latency to task pickup.
-    //
-    // Apple Silicon (aarch64+Apple): longer caps are safe because the QoS-aware
-    // kernel wakes parked threads promptly. E-core workers get a longer upper
-    // bound so they stay off the scheduler radar when P-cores have capacity.
-    //
-    // x86 Apple: moderate caps — no asymmetric core topology to worry about.
-    //
-    // Other platforms: keep original 250 µs floor, modest 2 ms cap.
-    #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
-    let (idle_park_min, idle_park_max) = match worker_class {
-        CpuClass::Efficient => (Duration::from_micros(200), Duration::from_millis(8)),
-        _ => (Duration::from_micros(100), Duration::from_millis(4)),
-    };
-    #[cfg(all(
-        any(target_os = "macos", target_os = "ios"),
-        not(target_arch = "aarch64")
-    ))]
-    let (idle_park_min, idle_park_max) = (Duration::from_micros(50), Duration::from_millis(1));
-    // Linux desktop: moderate idle backoff. Task submission always calls
-    // unpark() so the floor only affects re-check cadence after a spurious
-    // wake — real tasks are picked up immediately. The 100 µs floor keeps
-    // bursty wake-ups fast without burning CPU on idle polls. The 1 ms
-    // ceiling means a sleeping worker checks back at most once per ms
-    // before falling into indefinite park (zero-CPU sleep until unparked).
-    #[cfg(target_os = "linux")]
-    let (idle_park_min, idle_park_max) = (Duration::from_micros(100), Duration::from_millis(1));
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-    let (idle_park_min, idle_park_max) = (Duration::from_micros(250), Duration::from_millis(2));
+    // Adaptive idle behavior:
+    // 1) short pre-park spin/yield window to absorb bursty submissions
+    // 2) progressive park_timeout backoff
+    // 3) indefinite park once fully idle
+    let idle_policy = worker_idle_policy(worker_class);
 
     // Current adaptive park duration — doubles on each empty poll, reset on task found.
-    let mut idle_park = idle_park_min;
+    let mut idle_park = idle_policy.park_min;
+    let mut empty_poll_loops = 0u32;
 
     loop {
         if let Some(task) = queue.pop_for_worker(worker_class) {
             // Work found: reset adaptive park so the next idle cycle starts fresh.
-            idle_park = idle_park_min;
+            idle_park = idle_policy.park_min;
+            empty_poll_loops = 0;
 
             let started = Instant::now();
             let result = dispatcher.execute(task.payload);
@@ -794,23 +835,31 @@ fn worker_loop(
             break;
         }
 
-        // No work in queue. Avoid spin-looping (crossbeam Backoff is designed for
-        // lock contention, not queue polling — it burns CPU without doing real work).
-        // Instead, park the thread directly. task submission always calls unpark(),
-        // so latency to task pickup is not affected by the park duration.
-        //
-        // Once idle_park reaches its class maximum the thread parks indefinitely
-        // (park() instead of park_timeout()) so it truly sleeps until woken.
-        // unpark() on the next submission will resume it immediately.
-        if idle_park < idle_park_max {
+        let spin_budget = idle_policy.pre_park_spins;
+        let yield_budget = idle_policy.pre_park_yields;
+        if empty_poll_loops < spin_budget {
+            empty_poll_loops = empty_poll_loops.saturating_add(1);
+            std::hint::spin_loop();
+            continue;
+        }
+        if empty_poll_loops < spin_budget.saturating_add(yield_budget) {
+            empty_poll_loops = empty_poll_loops.saturating_add(1);
+            thread::yield_now();
+            continue;
+        }
+
+        // No work in queue after short pre-park probing. Transition to progressive
+        // timeout parking first, then indefinite park once fully idle.
+        if idle_park < idle_policy.park_max {
             thread::park_timeout(idle_park);
-            idle_park = (idle_park * 2).min(idle_park_max);
+            idle_park = (idle_park * 2).min(idle_policy.park_max);
         } else {
             thread::park();
             // Reset to minimum after waking from indefinite park so the next
             // burst of work gets the responsive short-park behavior.
-            idle_park = idle_park_min;
+            idle_park = idle_policy.park_min;
         }
+        empty_poll_loops = 0;
     }
 }
 
@@ -871,4 +920,17 @@ impl ClassCounters {
 
 fn elapsed_nanos_u64(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn parse_env_u32(key: &str) -> Option<u32> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn parse_env_duration_micros(key: &str) -> Option<Duration> {
+    let micros = std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())?;
+    Some(Duration::from_micros(micros))
 }
