@@ -41,10 +41,10 @@ pub use key_decode::{
 pub use scheduler::{
     ClassExecutionMetrics, CompletedPhysicsFrame, DispatchError, DispatchResult, Dispatcher,
     DispatcherDoubleBufferedTransforms, DispatcherPhase, DispatcherPhaseCallbacks,
-    DispatcherTaskContext, DispatcherTransformSample, MpsScheduler, NativeTask,
-    PhysicsDispatchTicket, PhysicsDispatchTrigger, SceneBuildTicket, SchedulerMetrics,
-    TaskDispatcher, TaskDispatcherConfig, TaskDispatcherMetrics, TaskEnvelope, TaskId, TaskPayload,
-    WasmTask,
+    DispatcherPhaseJobCounts, DispatcherPhasePlan, DispatcherTaskContext,
+    DispatcherTransformSample, MpsScheduler, NativeTask, PhysicsDispatchTicket,
+    PhysicsDispatchTrigger, SceneBuildTicket, SchedulerMetrics, TaskDispatcher,
+    TaskDispatcherConfig, TaskDispatcherMetrics, TaskEnvelope, TaskId, TaskPayload, WasmTask,
 };
 pub use simd::{
     detect_runtime_simd, AabbBoundsSoaMut, AabbBoundsSoaRef, AabbInputSoaRef, PositionSoaMut,

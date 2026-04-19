@@ -153,9 +153,9 @@ fn worker_idle_policy(worker_class: CpuClass) -> WorkerIdlePolicy {
 pub use dispatcher::{
     CompletedPhysicsFrame, DispatchError, DispatchResult, Dispatcher,
     DispatcherDoubleBufferedTransforms, DispatcherPhase, DispatcherPhaseCallbacks,
-    DispatcherTaskContext, DispatcherTransformSample, PhysicsDispatchTicket,
-    PhysicsDispatchTrigger, SceneBuildTicket, TaskDispatcher, TaskDispatcherConfig,
-    TaskDispatcherMetrics,
+    DispatcherPhaseJobCounts, DispatcherPhasePlan, DispatcherTaskContext,
+    DispatcherTransformSample, PhysicsDispatchTicket, PhysicsDispatchTrigger, SceneBuildTicket,
+    TaskDispatcher, TaskDispatcherConfig, TaskDispatcherMetrics,
 };
 pub use queue::{PriorityTaskQueue, QueueDepth};
 

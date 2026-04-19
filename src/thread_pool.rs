@@ -7,6 +7,7 @@
 //! - transform state uses double buffering so render N and physics N+1 never
 //!   race on the same write path
 
+use crate::scheduler::dispatcher::DispatcherPhaseJobCounts;
 use crate::simd::{SimdBackendKind, SimdKernelSet};
 use crate::topology::{CpuClass, CpuTopology};
 use crate::worker::{
@@ -419,6 +420,16 @@ pub struct MpsThreadPoolMetrics {
     pub simd_backend: SimdBackendKind,
     /// Number of f32 lanes exposed by the selected backend.
     pub simd_lanes: usize,
+    /// Planned phase jobs since startup.
+    pub phase_jobs: DispatcherPhaseJobCounts,
+    /// Completed phase jobs since startup.
+    pub phase_completed_jobs: DispatcherPhaseJobCounts,
+    /// Hottest worker busy ratio versus average worker busy time.
+    pub hot_worker_ratio: f32,
+    /// Per-phase backlog skew indicator.
+    pub phase_skew: f32,
+    /// Queue saturation event count.
+    pub queue_saturation_events: u64,
 }
 
 struct PhysicsJob {
@@ -714,6 +725,11 @@ impl MpsThreadPool {
             },
             simd_backend: self.simd_kernels.backend(),
             simd_lanes: self.simd_kernels.lanes_f32(),
+            phase_jobs: DispatcherPhaseJobCounts::default(),
+            phase_completed_jobs: DispatcherPhaseJobCounts::default(),
+            hot_worker_ratio: 1.0,
+            phase_skew: 1.0,
+            queue_saturation_events: 0,
         }
     }
 

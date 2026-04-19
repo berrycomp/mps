@@ -19,6 +19,45 @@ use std::time::{Duration, Instant};
 use wasmer::{imports, Instance, Module, Store, Value};
 
 const NO_ACTIVE_FRAME: u64 = u64::MAX;
+const DISPATCHER_PHASE_COUNT: usize = 5;
+
+/// Public phase job counters used for telemetry.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatcherPhaseJobCounts {
+    pub broadphase: u64,
+    pub narrowphase: u64,
+    pub solver: u64,
+    pub integration: u64,
+    pub sleep_finalize: u64,
+}
+
+impl DispatcherPhaseJobCounts {
+    fn max(self) -> u64 {
+        self.broadphase
+            .max(self.narrowphase)
+            .max(self.solver)
+            .max(self.integration)
+            .max(self.sleep_finalize)
+    }
+}
+
+/// Per-phase plan carried by one physics dispatch trigger.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DispatcherPhasePlan {
+    /// Number of items represented by this phase.
+    pub item_count: usize,
+    /// Chunk size used to split this phase into jobs.
+    pub chunk_size: usize,
+}
+
+impl DispatcherPhasePlan {
+    pub const fn new(item_count: usize, chunk_size: usize) -> Self {
+        Self {
+            item_count,
+            chunk_size,
+        }
+    }
+}
 
 /// Dispatcher-level result type.
 pub type DispatchResult<T = ()> = Result<T, DispatchError>;
@@ -259,16 +298,33 @@ pub enum DispatcherPhase {
     Broadphase,
     /// Physics narrowphase for frame N+1.
     Narrowphase,
+    /// Physics contact solve for frame N+1.
+    Solver,
     /// Physics integration/state write-back for frame N+1.
     Integration,
+    /// Sleep/finalize/write-back pass for frame N+1.
+    SleepFinalize,
 }
 
 impl DispatcherPhase {
     fn next_physics(self) -> Option<Self> {
         match self {
             Self::Broadphase => Some(Self::Narrowphase),
-            Self::Narrowphase => Some(Self::Integration),
-            Self::Integration | Self::SceneBuild => None,
+            Self::Narrowphase => Some(Self::Solver),
+            Self::Solver => Some(Self::Integration),
+            Self::Integration => Some(Self::SleepFinalize),
+            Self::SleepFinalize | Self::SceneBuild => None,
+        }
+    }
+
+    fn metric_index(self) -> Option<usize> {
+        match self {
+            Self::Broadphase => Some(0),
+            Self::Narrowphase => Some(1),
+            Self::Solver => Some(2),
+            Self::Integration => Some(3),
+            Self::SleepFinalize => Some(4),
+            Self::SceneBuild => None,
         }
     }
 }
@@ -308,8 +364,12 @@ pub struct DispatcherPhaseCallbacks {
     pub broadphase: Option<DispatcherPhaseHandler>,
     /// Narrowphase chunk callback.
     pub narrowphase: Option<DispatcherPhaseHandler>,
+    /// Solver chunk callback.
+    pub solver: Option<DispatcherPhaseHandler>,
     /// Integration chunk callback.
     pub integration: Option<DispatcherPhaseHandler>,
+    /// Sleep/finalize callback.
+    pub sleep_finalize: Option<DispatcherPhaseHandler>,
 }
 
 impl DispatcherPhaseCallbacks {
@@ -325,9 +385,21 @@ impl DispatcherPhaseCallbacks {
         self
     }
 
+    /// Attach a solver callback.
+    pub fn with_solver(mut self, handler: DispatcherPhaseHandler) -> Self {
+        self.solver = Some(handler);
+        self
+    }
+
     /// Attach an integration callback.
     pub fn with_integration(mut self, handler: DispatcherPhaseHandler) -> Self {
         self.integration = Some(handler);
+        self
+    }
+
+    /// Attach a sleep/finalize callback.
+    pub fn with_sleep_finalize(mut self, handler: DispatcherPhaseHandler) -> Self {
+        self.sleep_finalize = Some(handler);
         self
     }
 
@@ -335,7 +407,9 @@ impl DispatcherPhaseCallbacks {
         match phase {
             DispatcherPhase::Broadphase => self.broadphase.clone(),
             DispatcherPhase::Narrowphase => self.narrowphase.clone(),
+            DispatcherPhase::Solver => self.solver.clone(),
             DispatcherPhase::Integration => self.integration.clone(),
+            DispatcherPhase::SleepFinalize => self.sleep_finalize.clone(),
             DispatcherPhase::SceneBuild => None,
         }
     }
@@ -346,14 +420,16 @@ impl DispatcherPhaseCallbacks {
 pub struct PhysicsDispatchTrigger {
     /// Frame id assigned to the physics step.
     pub frame_id: u64,
-    /// Broadphase item count.
-    pub broadphase_items: usize,
-    /// Narrowphase item count.
-    pub narrowphase_items: usize,
-    /// Integration item count.
-    pub integration_items: usize,
-    /// Chunk size override for this frame.
-    pub chunk_size: usize,
+    /// Broadphase phase plan.
+    pub broadphase: DispatcherPhasePlan,
+    /// Narrowphase phase plan.
+    pub narrowphase: DispatcherPhasePlan,
+    /// Solver phase plan.
+    pub solver: DispatcherPhasePlan,
+    /// Integration phase plan.
+    pub integration: DispatcherPhasePlan,
+    /// Sleep/finalize phase plan.
+    pub sleep_finalize: DispatcherPhasePlan,
 }
 
 impl PhysicsDispatchTrigger {
@@ -367,10 +443,30 @@ impl PhysicsDispatchTrigger {
     ) -> Self {
         Self {
             frame_id,
-            broadphase_items,
-            narrowphase_items,
-            integration_items,
-            chunk_size,
+            broadphase: DispatcherPhasePlan::new(broadphase_items, chunk_size),
+            narrowphase: DispatcherPhasePlan::new(narrowphase_items, chunk_size),
+            solver: DispatcherPhasePlan::default(),
+            integration: DispatcherPhasePlan::new(integration_items, chunk_size),
+            sleep_finalize: DispatcherPhasePlan::default(),
+        }
+    }
+
+    /// Build a dispatch trigger with per-phase plans.
+    pub const fn with_phase_plans(
+        frame_id: u64,
+        broadphase: DispatcherPhasePlan,
+        narrowphase: DispatcherPhasePlan,
+        solver: DispatcherPhasePlan,
+        integration: DispatcherPhasePlan,
+        sleep_finalize: DispatcherPhasePlan,
+    ) -> Self {
+        Self {
+            frame_id,
+            broadphase,
+            narrowphase,
+            solver,
+            integration,
+            sleep_finalize,
         }
     }
 }
@@ -435,6 +531,16 @@ pub struct TaskDispatcherMetrics {
     pub simd_backend: SimdBackendKind,
     /// Number of f32 lanes exposed by the selected backend.
     pub simd_lanes: usize,
+    /// Planned jobs per phase since startup.
+    pub phase_jobs: DispatcherPhaseJobCounts,
+    /// Completed jobs per phase since startup.
+    pub phase_completed_jobs: DispatcherPhaseJobCounts,
+    /// Ratio between hottest worker busy time and average worker busy time.
+    pub hot_worker_ratio: f32,
+    /// Backlog skew between the fullest phase and the average non-empty phase.
+    pub phase_skew: f32,
+    /// Number of queue saturation events observed during scheduling.
+    pub queue_saturation_events: u64,
 }
 
 /// Bare-metal task dispatcher configuration.
@@ -506,17 +612,20 @@ struct DispatchFrameState {
     frame_id: u64,
     render_read_slot: usize,
     physics_write_slot: usize,
-    broadphase_items: usize,
-    narrowphase_items: usize,
-    integration_items: usize,
-    chunk_size: usize,
+    broadphase_plan: DispatcherPhasePlan,
+    narrowphase_plan: DispatcherPhasePlan,
+    solver_plan: DispatcherPhasePlan,
+    integration_plan: DispatcherPhasePlan,
+    sleep_finalize_plan: DispatcherPhasePlan,
     callbacks: DispatcherPhaseCallbacks,
     transforms: Arc<DispatcherDoubleBufferedTransforms>,
     simd: SimdKernelSet,
     planned_job_count: usize,
     broadphase_remaining: AtomicUsize,
     narrowphase_remaining: AtomicUsize,
+    solver_remaining: AtomicUsize,
     integration_remaining: AtomicUsize,
+    sleep_finalize_remaining: AtomicUsize,
 }
 
 impl DispatchFrameState {
@@ -529,48 +638,45 @@ impl DispatchFrameState {
         physics_write_slot: usize,
         default_chunk_size: usize,
     ) -> Self {
-        let chunk_size = if trigger.chunk_size == 0 {
-            default_chunk_size.max(1)
-        } else {
-            trigger.chunk_size.max(1)
-        };
-        let planned_job_count = phase_job_count(
-            trigger.broadphase_items,
-            chunk_size,
-            callbacks.broadphase.is_some(),
-        ) + phase_job_count(
-            trigger.narrowphase_items,
-            chunk_size,
-            callbacks.narrowphase.is_some(),
-        ) + phase_job_count(
-            trigger.integration_items,
-            chunk_size,
-            callbacks.integration.is_some(),
-        );
+        let broadphase_plan = normalize_phase_plan(trigger.broadphase, default_chunk_size);
+        let narrowphase_plan = normalize_phase_plan(trigger.narrowphase, default_chunk_size);
+        let solver_plan = normalize_phase_plan(trigger.solver, default_chunk_size);
+        let integration_plan = normalize_phase_plan(trigger.integration, default_chunk_size);
+        let sleep_finalize_plan = normalize_phase_plan(trigger.sleep_finalize, default_chunk_size);
+        let planned_job_count = phase_job_count(broadphase_plan, callbacks.broadphase.is_some())
+            + phase_job_count(narrowphase_plan, callbacks.narrowphase.is_some())
+            + phase_job_count(solver_plan, callbacks.solver.is_some())
+            + phase_job_count(integration_plan, callbacks.integration.is_some())
+            + phase_job_count(sleep_finalize_plan, callbacks.sleep_finalize.is_some());
 
         Self {
             frame_id: trigger.frame_id,
             render_read_slot,
             physics_write_slot,
-            broadphase_items: trigger.broadphase_items,
-            narrowphase_items: trigger.narrowphase_items,
-            integration_items: trigger.integration_items,
-            chunk_size,
+            broadphase_plan,
+            narrowphase_plan,
+            solver_plan,
+            integration_plan,
+            sleep_finalize_plan,
             callbacks,
             transforms,
             simd,
             planned_job_count,
             broadphase_remaining: AtomicUsize::new(0),
             narrowphase_remaining: AtomicUsize::new(0),
+            solver_remaining: AtomicUsize::new(0),
             integration_remaining: AtomicUsize::new(0),
+            sleep_finalize_remaining: AtomicUsize::new(0),
         }
     }
 
     fn item_count(&self, phase: DispatcherPhase) -> usize {
         match phase {
-            DispatcherPhase::Broadphase => self.broadphase_items,
-            DispatcherPhase::Narrowphase => self.narrowphase_items,
-            DispatcherPhase::Integration => self.integration_items,
+            DispatcherPhase::Broadphase => self.broadphase_plan.item_count,
+            DispatcherPhase::Narrowphase => self.narrowphase_plan.item_count,
+            DispatcherPhase::Solver => self.solver_plan.item_count,
+            DispatcherPhase::Integration => self.integration_plan.item_count,
+            DispatcherPhase::SleepFinalize => self.sleep_finalize_plan.item_count,
             DispatcherPhase::SceneBuild => 0,
         }
     }
@@ -579,17 +685,55 @@ impl DispatchFrameState {
         match phase {
             DispatcherPhase::Broadphase => &self.broadphase_remaining,
             DispatcherPhase::Narrowphase => &self.narrowphase_remaining,
+            DispatcherPhase::Solver => &self.solver_remaining,
             DispatcherPhase::Integration => &self.integration_remaining,
-            DispatcherPhase::SceneBuild => &self.integration_remaining,
+            DispatcherPhase::SleepFinalize => &self.sleep_finalize_remaining,
+            DispatcherPhase::SceneBuild => &self.sleep_finalize_remaining,
+        }
+    }
+
+    fn chunk_size(&self, phase: DispatcherPhase) -> usize {
+        match phase {
+            DispatcherPhase::Broadphase => self.broadphase_plan.chunk_size,
+            DispatcherPhase::Narrowphase => self.narrowphase_plan.chunk_size,
+            DispatcherPhase::Solver => self.solver_plan.chunk_size,
+            DispatcherPhase::Integration => self.integration_plan.chunk_size,
+            DispatcherPhase::SleepFinalize => self.sleep_finalize_plan.chunk_size,
+            DispatcherPhase::SceneBuild => 1,
         }
     }
 }
 
-fn phase_job_count(item_count: usize, chunk_size: usize, enabled: bool) -> usize {
-    if enabled && item_count > 0 {
-        item_count.div_ceil(chunk_size.max(1))
+fn normalize_phase_plan(
+    plan: DispatcherPhasePlan,
+    default_chunk_size: usize,
+) -> DispatcherPhasePlan {
+    let chunk_size = if plan.chunk_size == 0 {
+        default_chunk_size.max(1)
+    } else {
+        plan.chunk_size.max(1)
+    };
+    DispatcherPhasePlan {
+        item_count: plan.item_count,
+        chunk_size,
+    }
+}
+
+fn phase_job_count(plan: DispatcherPhasePlan, enabled: bool) -> usize {
+    if enabled && plan.item_count > 0 {
+        plan.item_count.div_ceil(plan.chunk_size.max(1))
     } else {
         0
+    }
+}
+
+fn phase_counts_from_array(values: &[u64; DISPATCHER_PHASE_COUNT]) -> DispatcherPhaseJobCounts {
+    DispatcherPhaseJobCounts {
+        broadphase: values[0],
+        narrowphase: values[1],
+        solver: values[2],
+        integration: values[3],
+        sleep_finalize: values[4],
     }
 }
 
@@ -610,6 +754,10 @@ pub struct TaskDispatcher {
     active_frame_id: Arc<AtomicU64>,
     default_chunk_size: usize,
     simd_kernels: SimdKernelSet,
+    phase_jobs: Arc<[AtomicU64; DISPATCHER_PHASE_COUNT]>,
+    phase_completed_jobs: Arc<[AtomicU64; DISPATCHER_PHASE_COUNT]>,
+    worker_busy_us: Vec<Arc<AtomicU64>>,
+    queue_saturation_events: Arc<AtomicU64>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -641,9 +789,13 @@ impl TaskDispatcher {
         let published_frames = Arc::new(AtomicU64::new(0));
         let latest_published_frame = Arc::new(AtomicU64::new(0));
         let active_frame_id = Arc::new(AtomicU64::new(NO_ACTIVE_FRAME));
+        let phase_jobs = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+        let phase_completed_jobs = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+        let queue_saturation_events = Arc::new(AtomicU64::new(0));
 
         let simd_kernels = SimdKernelSet::for_capabilities(topology.simd);
         let mut workers = Vec::with_capacity(config.worker_core_ids.len());
+        let mut worker_busy_us = Vec::with_capacity(config.worker_core_ids.len());
         for (worker_index, &core_id) in config.worker_core_ids.iter().enumerate() {
             let class = topology.class_for_core(core_id);
             let mut launch = WorkerLaunchConfig::new(
@@ -660,6 +812,8 @@ impl TaskDispatcher {
                 launch.realtime_priority = None;
             }
             normalize_worker_launch_for_host(&mut launch);
+            let worker_busy_slot = Arc::new(AtomicU64::new(0));
+            worker_busy_us.push(Arc::clone(&worker_busy_slot));
 
             let handle = spawn_worker(launch, Arc::clone(&signal), {
                 let worker_queue = Arc::clone(&queue);
@@ -671,6 +825,9 @@ impl TaskDispatcher {
                 let worker_published_frames = Arc::clone(&published_frames);
                 let worker_latest_published_frame = Arc::clone(&latest_published_frame);
                 let worker_active_frame_id = Arc::clone(&active_frame_id);
+                let worker_phase_jobs = Arc::clone(&phase_jobs);
+                let worker_phase_completed_jobs = Arc::clone(&phase_completed_jobs);
+                let worker_queue_saturation_events = Arc::clone(&queue_saturation_events);
                 move |launch, signal| {
                     dispatcher_worker_loop(
                         launch,
@@ -683,6 +840,10 @@ impl TaskDispatcher {
                         worker_published_frames,
                         worker_latest_published_frame,
                         worker_active_frame_id,
+                        worker_phase_jobs,
+                        worker_phase_completed_jobs,
+                        worker_busy_slot,
+                        worker_queue_saturation_events,
                         worker_signal,
                     );
                 }
@@ -707,6 +868,10 @@ impl TaskDispatcher {
             active_frame_id,
             default_chunk_size: config.default_chunk_size.max(1),
             simd_kernels,
+            phase_jobs,
+            phase_completed_jobs,
+            worker_busy_us,
+            queue_saturation_events,
             workers,
         })
     }
@@ -803,6 +968,66 @@ impl TaskDispatcher {
 
     /// Snapshot dispatcher metrics.
     pub fn metrics(&self) -> TaskDispatcherMetrics {
+        let phase_jobs = phase_counts_from_array(&std::array::from_fn(|index| {
+            self.phase_jobs[index].load(Ordering::Acquire)
+        }));
+        let phase_completed_jobs = phase_counts_from_array(&std::array::from_fn(|index| {
+            self.phase_completed_jobs[index].load(Ordering::Acquire)
+        }));
+        let mut busy_total = 0u64;
+        let mut busy_max = 0u64;
+        for slot in &self.worker_busy_us {
+            let busy = slot.load(Ordering::Acquire);
+            busy_total = busy_total.saturating_add(busy);
+            busy_max = busy_max.max(busy);
+        }
+        let hot_worker_ratio = if self.worker_busy_us.is_empty() || busy_total == 0 {
+            1.0
+        } else {
+            let avg_busy = busy_total as f32 / self.worker_busy_us.len() as f32;
+            if avg_busy <= f32::EPSILON {
+                1.0
+            } else {
+                busy_max as f32 / avg_busy
+            }
+        };
+        let remaining = DispatcherPhaseJobCounts {
+            broadphase: phase_jobs
+                .broadphase
+                .saturating_sub(phase_completed_jobs.broadphase),
+            narrowphase: phase_jobs
+                .narrowphase
+                .saturating_sub(phase_completed_jobs.narrowphase),
+            solver: phase_jobs
+                .solver
+                .saturating_sub(phase_completed_jobs.solver),
+            integration: phase_jobs
+                .integration
+                .saturating_sub(phase_completed_jobs.integration),
+            sleep_finalize: phase_jobs
+                .sleep_finalize
+                .saturating_sub(phase_completed_jobs.sleep_finalize),
+        };
+        let mut non_zero_phases = 0u32;
+        let mut remaining_total = 0u64;
+        for value in [
+            remaining.broadphase,
+            remaining.narrowphase,
+            remaining.solver,
+            remaining.integration,
+            remaining.sleep_finalize,
+        ] {
+            if value > 0 {
+                non_zero_phases += 1;
+                remaining_total = remaining_total.saturating_add(value);
+            }
+        }
+        let phase_skew = if non_zero_phases == 0 || remaining_total == 0 {
+            1.0
+        } else {
+            let avg_remaining = remaining_total as f32 / non_zero_phases as f32;
+            (remaining.max() as f32 / avg_remaining.max(1.0)).max(1.0)
+        };
         TaskDispatcherMetrics {
             worker_count: self.worker_core_ids.len(),
             queued_jobs: self.queued_jobs.load(Ordering::Acquire),
@@ -817,6 +1042,11 @@ impl TaskDispatcher {
             },
             simd_backend: self.simd_kernels.backend(),
             simd_lanes: self.simd_kernels.lanes_f32(),
+            phase_jobs,
+            phase_completed_jobs,
+            hot_worker_ratio,
+            phase_skew,
+            queue_saturation_events: self.queue_saturation_events.load(Ordering::Acquire),
         }
     }
 
@@ -846,6 +1076,8 @@ impl TaskDispatcher {
                 &self.queue,
                 &self.queued_jobs,
                 &self.in_flight_jobs,
+                &self.phase_jobs,
+                &self.queue_saturation_events,
                 &self.signal,
             )
         }
@@ -889,10 +1121,12 @@ fn schedule_frame_phase(
     queue: &ArrayQueue<DispatchJob>,
     queued_jobs: &AtomicU64,
     in_flight_jobs: &AtomicU64,
+    phase_jobs: &[AtomicU64; DISPATCHER_PHASE_COUNT],
+    queue_saturation_events: &AtomicU64,
     signal: &WorkerSignal,
 ) -> DispatchResult {
     let item_count = frame.item_count(phase);
-    let chunk_size = frame.chunk_size.max(1);
+    let chunk_size = frame.chunk_size(phase).max(1);
     let job_count = item_count.div_ceil(chunk_size);
     frame
         .remaining_counter(phase)
@@ -900,6 +1134,9 @@ fn schedule_frame_phase(
 
     queued_jobs.fetch_add(job_count as u64, Ordering::AcqRel);
     in_flight_jobs.fetch_add(job_count as u64, Ordering::AcqRel);
+    if let Some(index) = phase.metric_index() {
+        phase_jobs[index].fetch_add(job_count as u64, Ordering::AcqRel);
+    }
 
     for job_index in 0..job_count {
         let start = job_index * chunk_size;
@@ -911,6 +1148,7 @@ fn schedule_frame_phase(
                 phase,
                 work_range: start..end,
             },
+            queue_saturation_events,
             signal,
         )?;
     }
@@ -921,6 +1159,7 @@ fn schedule_frame_phase(
 fn push_dispatch_job(
     queue: &ArrayQueue<DispatchJob>,
     mut job: DispatchJob,
+    queue_saturation_events: &AtomicU64,
     signal: &WorkerSignal,
 ) -> DispatchResult {
     let mut spin_count = 0u32;
@@ -930,6 +1169,7 @@ fn push_dispatch_job(
             Err(returned_job) => {
                 job = returned_job;
                 spin_count = spin_count.saturating_add(1);
+                queue_saturation_events.fetch_add(1, Ordering::Relaxed);
                 if spin_count <= 64 {
                     std::hint::spin_loop();
                 } else if spin_count <= 256 {
@@ -957,6 +1197,10 @@ fn dispatcher_worker_loop(
     published_frames: Arc<AtomicU64>,
     latest_published_frame: Arc<AtomicU64>,
     active_frame_id: Arc<AtomicU64>,
+    phase_jobs: Arc<[AtomicU64; DISPATCHER_PHASE_COUNT]>,
+    phase_completed_jobs: Arc<[AtomicU64; DISPATCHER_PHASE_COUNT]>,
+    worker_busy_us: Arc<AtomicU64>,
+    queue_saturation_events: Arc<AtomicU64>,
     wake_signal: Arc<WorkerSignal>,
 ) {
     let mut observed_epoch = signal.observed_epoch();
@@ -975,6 +1219,10 @@ fn dispatcher_worker_loop(
                 &published_frames,
                 &latest_published_frame,
                 &active_frame_id,
+                &phase_jobs,
+                &phase_completed_jobs,
+                &worker_busy_us,
+                &queue_saturation_events,
                 &wake_signal,
             );
             observed_epoch = signal.observed_epoch();
@@ -1008,8 +1256,13 @@ fn execute_dispatch_job(
     published_frames: &AtomicU64,
     latest_published_frame: &AtomicU64,
     active_frame_id: &AtomicU64,
+    phase_jobs: &[AtomicU64; DISPATCHER_PHASE_COUNT],
+    phase_completed_jobs: &[AtomicU64; DISPATCHER_PHASE_COUNT],
+    worker_busy_us: &AtomicU64,
+    queue_saturation_events: &AtomicU64,
     signal: &WorkerSignal,
 ) {
+    let job_started = Instant::now();
     if let Some(handler) = job.frame.callbacks.handler_for(job.phase) {
         let context = DispatcherTaskContext {
             frame_id: job.frame.frame_id,
@@ -1025,9 +1278,16 @@ fn execute_dispatch_job(
         };
         handler(&context);
     }
+    worker_busy_us.fetch_add(
+        job_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        Ordering::AcqRel,
+    );
 
     completed_jobs.fetch_add(1, Ordering::AcqRel);
     in_flight_jobs.fetch_sub(1, Ordering::AcqRel);
+    if let Some(index) = job.phase.metric_index() {
+        phase_completed_jobs[index].fetch_add(1, Ordering::AcqRel);
+    }
 
     if job
         .frame
@@ -1043,6 +1303,9 @@ fn execute_dispatch_job(
                     queue,
                     queued_jobs,
                     in_flight_jobs,
+                    phase_jobs,
+                    phase_completed_jobs,
+                    queue_saturation_events,
                     signal,
                     completed_frames,
                     published_frames,
@@ -1069,6 +1332,9 @@ fn schedule_followup_phase_from_worker(
     queue: &ArrayQueue<DispatchJob>,
     queued_jobs: &AtomicU64,
     in_flight_jobs: &AtomicU64,
+    phase_jobs: &[AtomicU64; DISPATCHER_PHASE_COUNT],
+    _phase_completed_jobs: &[AtomicU64; DISPATCHER_PHASE_COUNT],
+    queue_saturation_events: &AtomicU64,
     signal: &WorkerSignal,
     completed_frames: &SegQueue<CompletedPhysicsFrame>,
     published_frames: &AtomicU64,
@@ -1083,6 +1349,9 @@ fn schedule_followup_phase_from_worker(
                 queue,
                 queued_jobs,
                 in_flight_jobs,
+                phase_jobs,
+                _phase_completed_jobs,
+                queue_saturation_events,
                 signal,
                 completed_frames,
                 published_frames,
@@ -1102,7 +1371,16 @@ fn schedule_followup_phase_from_worker(
             }
         }
     } else {
-        schedule_frame_phase(frame, phase, queue, queued_jobs, in_flight_jobs, signal)
+        schedule_frame_phase(
+            frame,
+            phase,
+            queue,
+            queued_jobs,
+            in_flight_jobs,
+            phase_jobs,
+            queue_saturation_events,
+            signal,
+        )
     }
 }
 
