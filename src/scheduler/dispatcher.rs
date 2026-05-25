@@ -762,6 +762,7 @@ pub struct TaskDispatcher {
     worker_core_ids: Vec<usize>,
     transforms: Arc<DispatcherDoubleBufferedTransforms>,
     queue: Arc<ArrayQueue<DispatchJob>>,
+    paradox_queue: Arc<SegQueue<Box<dyn FnOnce() + Send>>>,
     completed_frames: Arc<SegQueue<CompletedPhysicsFrame>>,
     signal: Arc<WorkerSignal>,
     queued_jobs: Arc<AtomicU64>,
@@ -796,6 +797,7 @@ impl TaskDispatcher {
 
         let topology = config.topology.clone();
         let queue = Arc::new(ArrayQueue::new(config.queue_capacity));
+        let paradox_queue = Arc::new(SegQueue::new());
         let completed_frames = Arc::new(SegQueue::new());
         let signal = Arc::new(WorkerSignal::default());
         let transforms = Arc::new(DispatcherDoubleBufferedTransforms::new(
@@ -836,6 +838,7 @@ impl TaskDispatcher {
 
             let handle = spawn_worker(launch, Arc::clone(&signal), {
                 let worker_queue = Arc::clone(&queue);
+                let worker_paradox_queue = Arc::clone(&paradox_queue);
                 let worker_completed_frames = Arc::clone(&completed_frames);
                 let worker_signal = Arc::clone(&signal);
                 let worker_queued_jobs = Arc::clone(&queued_jobs);
@@ -852,6 +855,7 @@ impl TaskDispatcher {
                         launch,
                         signal,
                         worker_queue,
+                        worker_paradox_queue,
                         worker_completed_frames,
                         worker_queued_jobs,
                         worker_in_flight_jobs,
@@ -876,6 +880,7 @@ impl TaskDispatcher {
             worker_core_ids: config.worker_core_ids,
             transforms,
             queue,
+            paradox_queue,
             completed_frames,
             signal,
             queued_jobs,
@@ -1124,6 +1129,27 @@ impl TaskDispatcher {
         });
         self.signal.wake_all();
     }
+
+    /// Submit a one-off native closure to the dispatcher's paradox job queue.
+    /// Idle workers will pick these up when no physics frame jobs are available.
+    pub fn submit_paradox_job<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.paradox_queue.push(Box::new(f));
+        self.signal.wake_one();
+    }
+
+    /// Try to pop and execute one paradox job on the caller thread.
+    /// Returns `true` if a job was executed.
+    pub fn try_execute_paradox_job(&self) -> bool {
+        if let Some(job) = self.paradox_queue.pop() {
+            job();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for TaskDispatcher {
@@ -1210,6 +1236,7 @@ fn dispatcher_worker_loop(
     launch: WorkerLaunchConfig,
     signal: Arc<WorkerSignal>,
     queue: Arc<ArrayQueue<DispatchJob>>,
+    paradox_queue: Arc<SegQueue<Box<dyn FnOnce() + Send>>>,
     completed_frames: Arc<SegQueue<CompletedPhysicsFrame>>,
     queued_jobs: Arc<AtomicU64>,
     in_flight_jobs: Arc<AtomicU64>,
@@ -1244,6 +1271,17 @@ fn dispatcher_worker_loop(
                 &worker_busy_us,
                 &queue_saturation_events,
                 &wake_signal,
+            );
+            observed_epoch = signal.observed_epoch();
+            continue;
+        }
+
+        if let Some(job) = paradox_queue.pop() {
+            let started = Instant::now();
+            job();
+            worker_busy_us.fetch_add(
+                started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                Ordering::AcqRel,
             );
             observed_epoch = signal.observed_epoch();
             continue;
