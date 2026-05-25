@@ -7,6 +7,7 @@
 use super::{TaskPayload, WasmTask};
 use crate::simd::{SimdBackendKind, SimdKernelSet};
 use crate::topology::{CpuClass, CpuTopology};
+use crate::tuning::{CompressionMetrics, MpsCompressionConfig, MpsTuningProfile};
 use crate::worker::{
     normalize_worker_launch_for_host, spawn_worker, WorkerLaunchConfig, WorkerSignal,
 };
@@ -541,6 +542,8 @@ pub struct TaskDispatcherMetrics {
     pub phase_skew: f32,
     /// Number of queue saturation events observed during scheduling.
     pub queue_saturation_events: u64,
+    /// Compression sub-system metrics.
+    pub compression: CompressionMetrics,
 }
 
 /// Bare-metal task dispatcher configuration.
@@ -570,6 +573,8 @@ pub struct TaskDispatcherConfig {
     pub strict_affinity: bool,
     /// Attempt `SCHED_FIFO` on Linux for worker threads.
     pub enable_realtime_policy: bool,
+    /// Compression configuration for transform data.
+    pub compression: MpsCompressionConfig,
 }
 
 impl Default for TaskDispatcherConfig {
@@ -588,11 +593,25 @@ impl Default for TaskDispatcherConfig {
             unknown_nice: -6,
             strict_affinity: true,
             enable_realtime_policy: true,
+            compression: MpsCompressionConfig::default(),
         }
     }
 }
 
 impl TaskDispatcherConfig {
+    /// Apply a tuning profile to this configuration.
+    pub fn apply_tuning(&mut self, tuning: &MpsTuningProfile) {
+        self.spin_iterations = tuning.spin_iterations;
+        self.yield_iterations = tuning.yield_iterations;
+        self.performance_nice = tuning.performance_nice;
+        self.efficient_nice = tuning.efficient_nice;
+        self.unknown_nice = tuning.unknown_nice;
+        self.strict_affinity = tuning.strict_affinity;
+        self.enable_realtime_policy = tuning.enable_realtime_policy;
+        self.queue_capacity = self.queue_capacity.saturating_mul(tuning.queue_capacity_multiplier);
+        self.default_chunk_size = tuning.default_chunk_size;
+    }
+
     fn nice_value_for_class(&self, class: CpuClass) -> i32 {
         match class {
             CpuClass::Performance => self.performance_nice,
@@ -1047,6 +1066,7 @@ impl TaskDispatcher {
             hot_worker_ratio,
             phase_skew,
             queue_saturation_events: self.queue_saturation_events.load(Ordering::Acquire),
+            compression: CompressionMetrics::default(),
         }
     }
 

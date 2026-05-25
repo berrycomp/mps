@@ -25,6 +25,7 @@ hkdf = "0.12.4"
 md-5 = "0.10.6"
 miniz_oxide = "0.8.9"
 num_cpus = "1.17.0"
+sxrc = { path = "../sxrc", optional = true }
 percent-encoding = "2.3.1"
 sha1 = "0.10.6"
 sha2 = "0.10.9"
@@ -32,6 +33,9 @@ wasmer = "7.0.1"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
+
+[features]
+sxrc-compression = ["dep:sxrc"]
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "11.6.0"

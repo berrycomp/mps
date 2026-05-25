@@ -22,6 +22,7 @@ pub mod scheduler;
 pub mod simd;
 pub mod thread_pool;
 pub mod topology;
+pub mod tuning;
 pub mod worker;
 
 pub use balancer::{CorePreference, LoadBalancer, RoutingDecision, TaskPriority};
@@ -57,3 +58,6 @@ pub use thread_pool::{
     ThreadPoolError, TransformSample,
 };
 pub use topology::{CpuClass, CpuCore, CpuTopology};
+pub use tuning::{
+    CompressionMetrics, MpsCompressionConfig, MpsPerformanceProfile, MpsTuningProfile,
+};

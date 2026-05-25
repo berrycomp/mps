@@ -9,6 +9,7 @@
 
 use crate::scheduler::dispatcher::DispatcherPhaseJobCounts;
 use crate::simd::{SimdBackendKind, SimdKernelSet};
+use crate::tuning::CompressionMetrics;
 use crate::topology::{CpuClass, CpuTopology};
 use crate::worker::{
     normalize_worker_launch_for_host, spawn_worker, WorkerLaunchConfig, WorkerSignal,
@@ -430,6 +431,8 @@ pub struct MpsThreadPoolMetrics {
     pub phase_skew: f32,
     /// Queue saturation event count.
     pub queue_saturation_events: u64,
+    /// Compression sub-system metrics.
+    pub compression: CompressionMetrics,
 }
 
 struct PhysicsJob {
@@ -730,6 +733,7 @@ impl MpsThreadPool {
             hot_worker_ratio: 1.0,
             phase_skew: 1.0,
             queue_saturation_events: 0,
+            compression: CompressionMetrics::default(),
         }
     }
 
