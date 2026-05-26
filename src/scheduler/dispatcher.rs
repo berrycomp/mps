@@ -1137,7 +1137,7 @@ impl TaskDispatcher {
         F: FnOnce() + Send + 'static,
     {
         self.paradox_queue.push(Box::new(f));
-        self.signal.wake_one();
+        self.signal.wake_all();
     }
 
     /// Try to pop and execute one paradox job on the caller thread.
